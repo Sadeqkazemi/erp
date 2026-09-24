@@ -9,6 +9,7 @@
 - [x] CSRF rejection — `test/platform-core.e2e-spec.ts` missing CSRF
 - [x] Upstream timeout does not take down core health — `test/platform-core.e2e-spec.ts` probe
 - [x] Session rotation invalidates the old cookie — `test/platform-core.e2e-spec.ts` rotates the session
+- [x] Users can inspect and revoke only their own opaque sessions; current-session revocation clears cookies. Platform admins can atomically disable another staff account and revoke all its sessions, but cannot disable themselves or customer/agency identities (`identity-lifecycle.e2e-spec.ts`).
 - [x] Optional consent defaults off and withdrawal wins — `test/platform-core.e2e-spec.ts` records consent withdrawal
 - [x] Illegal workflow transition is rejected — `src/modules/workflow/workflow-transitions.spec.ts` and e2e
 - [x] Outbox dispatch uses an idempotency key per event — `test/platform-core.e2e-spec.ts` checks accepted events

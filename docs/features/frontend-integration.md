@@ -6,6 +6,7 @@ The management UI must call the platform core through a same-origin, allowlisted
 | --- | --- | --- | --- |
 | Sign in | `POST /v1/sessions` | Staff username/password/TOTP; `Origin` checked | Keep returned CSRF token in memory; session ID only in HttpOnly cookie |
 | Restore session | `GET /v1/sessions/me` | Active cookie | Require `PLATFORM_ADMIN` for management screens; returns ID, username, realm, role and tenant ID |
+| Session security | `GET /v1/sessions`, `DELETE /v1/sessions/:id` | Active cookie; delete requires CSRF and Origin | Show only session metadata; clear local state when the current session is revoked |
 | Dashboard | `GET /v1/control-plane/summary` | Platform admin | Show stored control-plane counts; `domainSales.status=UNCONFIGURED` means no sales number |
 | Audit | `GET /v1/audit-events?limit=30&cursor=…` | Platform admin | Show timestamp, actor principal ID, action, object and correlation ID; cursor pages |
 | Logout | `POST /v1/sessions/logout` | Active cookie, allowed Origin and `x-csrf-token` | Clear local state and show sign-in screen |

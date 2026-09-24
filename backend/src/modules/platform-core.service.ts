@@ -300,6 +300,76 @@ export class PlatformCoreService {
     });
   }
 
+  async listOwnSessions(actor: AuthenticatedPrincipal): Promise<Array<{
+    id: string; current: boolean; createdAt: string; expiresAt: string; revokedAt: string | null; active: boolean;
+  }>> {
+    const sessions = await this.dataSource.getRepository(SessionEntity).find({
+      where: { principalId: actor.id }, order: { createdAt: 'DESC' }, take: 100,
+    });
+    const now = Date.now();
+    return sessions.map((session) => ({
+      id: session.id,
+      current: session.id === actor.sessionId,
+      createdAt: session.createdAt.toISOString(),
+      expiresAt: session.expiresAt.toISOString(),
+      revokedAt: session.revokedAt?.toISOString() ?? null,
+      active: !session.revokedAt && session.expiresAt.getTime() > now,
+    }));
+  }
+
+  async revokeOwnSession(
+    actor: AuthenticatedPrincipal, sessionId: string, correlationId: string,
+  ): Promise<{ id: string; current: boolean; revoked: boolean }> {
+    return this.dataSource.transaction(async (manager) => {
+      const session = await manager.findOne(SessionEntity, {
+        where: { id: sessionId, principalId: actor.id }, lock: { mode: 'pessimistic_write' },
+      });
+      if (!session) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'نشست یافت نشد.' });
+      const newlyRevoked = !session.revokedAt;
+      if (newlyRevoked) {
+        session.revokedAt = new Date();
+        await manager.save(session);
+        await this.appendControl(manager, {
+          actorId: actor.id, action: 'session.revoked', objectType: 'session', objectId: session.id,
+          correlationId, eventName: 'identity.session.revoked.v1', payload: { sessionId: session.id },
+        });
+      }
+      return { id: session.id, current: session.id === actor.sessionId, revoked: newlyRevoked };
+    });
+  }
+
+  async disableStaffPrincipal(
+    actor: AuthenticatedPrincipal, principalId: string, correlationId: string,
+  ): Promise<{ id: string; status: 'DISABLED'; revokedSessions: number }> {
+    this.requirePlatformAdmin(actor);
+    if (actor.id === principalId) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'مدیر نمی‌تواند حساب فعال خودش را غیرفعال کند.' });
+    }
+    return this.dataSource.transaction(async (manager) => {
+      const principal = await manager.findOne(PrincipalEntity, {
+        where: { id: principalId }, lock: { mode: 'pessimistic_write' },
+      });
+      if (!principal) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'هویت یافت نشد.' });
+      if (principal.realm !== 'STAFF') {
+        throw new ForbiddenException({ code: ErrorCode.REALM_REJECTED, message: 'مدیریت هویت مشتری و آژانس در سرویس مالک آن انجام می‌شود.' });
+      }
+      const stateChanged = principal.status !== 'DISABLED';
+      if (stateChanged) {
+        principal.status = 'DISABLED';
+        await manager.save(principal);
+      }
+      const revoked = await manager.update(SessionEntity, { principalId: principal.id, revokedAt: IsNull() }, { revokedAt: new Date() });
+      if (stateChanged || (revoked.affected ?? 0) > 0) {
+        await this.appendControl(manager, {
+          actorId: actor.id, action: 'staff.disabled', objectType: 'principal', objectId: principal.id,
+          correlationId, eventName: 'identity.staff.disabled.v1',
+          payload: { principalId: principal.id, status: principal.status },
+        });
+      }
+      return { id: principal.id, status: 'DISABLED', revokedSessions: revoked.affected ?? 0 };
+    });
+  }
+
   async registerPanel(
     actor: AuthenticatedPrincipal,
     input: {

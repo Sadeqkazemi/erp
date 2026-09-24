@@ -282,6 +282,31 @@ export class PlatformCoreController {
     return { success: true, data: { id: actor.id, username: actor.username, realm: actor.realm, role: actor.role, tenantId: actor.tenantId } };
   }
 
+  @Get('v1/sessions')
+  @ApiOperation({ summary: 'فهرست نشست‌های خود کاربر بدون نمایش توکن یا مشخصات محرمانه' })
+  async sessions(@Req() req: AuthedRequest) {
+    const actor = await this.actor(req);
+    return { success: true, data: await this.core.listOwnSessions(actor) };
+  }
+
+  @Delete('v1/sessions/:id')
+  @ApiOperation({ summary: 'ابطال یکی از نشست‌های خود کاربر' })
+  async revokeSession(
+    @Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response, @Param('id', ParseUUIDPipe) id: string,
+  ) {
+    const actor = await this.requireMutation(req);
+    const result = await this.core.revokeOwnSession(actor, id, this.correlation(req));
+    if (result.current) this.clearCookies(res);
+    return { success: true, data: result };
+  }
+
+  @Post('v1/staff/:id/disable')
+  @ApiOperation({ summary: 'غیرفعال‌سازی فوری حساب کارمند و ابطال همه نشست‌ها' })
+  async disableStaff(@Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string) {
+    const actor = await this.requireMutation(req);
+    return { success: true, data: await this.core.disableStaffPrincipal(actor, id, this.correlation(req)) };
+  }
+
   @Post('v1/sessions/rotate')
   @ApiOperation({ summary: 'چرخش نشست پس از ورود یا تغییر امتیاز' })
   async rotate(@Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response) {
