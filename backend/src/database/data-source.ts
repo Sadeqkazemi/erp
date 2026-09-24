@@ -12,6 +12,7 @@ import {
   WorkflowRunEntity,
 } from './entities';
 import { PlatformCoreFoundation1710000000000 } from './migrations/1710000000000-PlatformCoreFoundation';
+import { PlatformCoreHardening1710000000001 } from './migrations/1710000000001-PlatformCoreHardening';
 
 export const coreEntities = [
   PrincipalEntity,
@@ -28,13 +29,13 @@ export const coreEntities = [
 
 export function createDataSource(databaseUrl = process.env.DATABASE_URL): DataSource {
   if (!databaseUrl) {
-    throw new Error('Missing required environment variable DATABASE_URL');
+    throw new Error('Missing database URL: set DATABASE_URL (runtime) or DATABASE_MIGRATION_URL (migrations)');
   }
   return new DataSource({
     type: 'postgres',
     url: databaseUrl,
     entities: coreEntities,
-    migrations: [PlatformCoreFoundation1710000000000],
+    migrations: [PlatformCoreFoundation1710000000000, PlatformCoreHardening1710000000001],
     synchronize: false,
   });
 }

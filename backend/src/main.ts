@@ -14,7 +14,10 @@ async function bootstrap(): Promise<void> {
   assertProductionSafe(env);
   const dataSource = createDataSource(env.databaseUrl);
   await dataSource.initialize();
-  await dataSource.runMigrations();
+  // Schema changes run separately with the migration role (npm run migration:run).
+  if (await dataSource.showMigrations()) {
+    throw new Error('Pending migrations: run npm run migration:run with DATABASE_MIGRATION_URL before starting');
+  }
   const app = await NestFactory.create(AppModule.register(env, dataSource), { bufferLogs: true });
   app.useLogger(app.get(Logger));
   app.use(helmet());
@@ -23,8 +26,11 @@ async function bootstrap(): Promise<void> {
   server.set('allowedOrigins', env.allowedOrigins);
   app.enableCors({ origin: env.allowedOrigins, credentials: true });
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
-  const swagger = new DocumentBuilder().setTitle('BlueJet Platform Core').setVersion('v1').build();
-  SwaggerModule.setup('docs', app, SwaggerModule.createDocument(app, swagger));
+  if (env.exposeApiDocs) {
+    const swagger = new DocumentBuilder().setTitle('BlueJet Platform Core').setVersion('v1').build();
+    SwaggerModule.setup('docs', app, SwaggerModule.createDocument(app, swagger));
+  }
+  app.enableShutdownHooks();
   await app.listen(env.port);
 }
 

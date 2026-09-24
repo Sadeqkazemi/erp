@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   platform-core:
     runs-on: ubuntu-latest
@@ -12,22 +15,28 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: core
-          POSTGRES_PASSWORD: core
+          POSTGRES_USER: ci_admin
+          POSTGRES_PASSWORD: ci-only
           POSTGRES_DB: platform_core_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U core -d platform_core_test"
+          --health-cmd "pg_isready -U ci_admin -d platform_core_test"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
     defaults:
       run:
         working-directory: backend
+    env:
+      MIGRATION_URL: postgresql://core_migration:ci-migration@127.0.0.1:5432/platform_core_test
+      RUNTIME_URL: postgresql://core_runtime:ci-runtime@127.0.0.1:5432/platform_core_test
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # Third-party actions are pinned to full commit SHAs (v4.3.1 and v4.4.0).
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
           cache: npm
@@ -35,6 +44,21 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm test
+      - name: Dependency audit (fails on critical; open high findings are tracked in docs/features/platform-core.md)
+        run: npm audit --omit=dev --audit-level=critical
+      - name: Provision separate migration and runtime roles
         env:
-          PLATFORM_CORE_TEST_DATABASE_URL: postgresql://core:core@127.0.0.1:5432/platform_core_test
+          PGPASSWORD: ci-only
+        run: >-
+          psql -h 127.0.0.1 -U ci_admin -d postgres -v ON_ERROR_STOP=1
+          -v db=platform_core_test -v migration_password=ci-migration -v runtime_password=ci-runtime
+          -f scripts/provision-roles.sql
+      - name: Apply migrations with the migration role
+        run: npm run migration:run
+        env:
+          DATABASE_MIGRATION_URL: ${{ env.MIGRATION_URL }}
+      - name: Tests run as the least-privilege runtime role
+        run: npm test
+        env:
+          PLATFORM_CORE_TEST_DATABASE_URL: ${{ env.RUNTIME_URL }}
+          PLATFORM_CORE_TEST_MIGRATION_DATABASE_URL: ${{ env.MIGRATION_URL }}

@@ -1,3 +1,5 @@
+import { loadPanelTokenKeys, PanelTokenKeys } from '../common/crypto';
+
 export const CORE_ENV = Symbol('CORE_ENV');
 
 export interface CoreEnv {
@@ -7,10 +9,12 @@ export interface CoreEnv {
   cookieSecure: boolean;
   sessionTtlSeconds: number;
   panelTokenTtlSeconds: number;
-  jwtSecret: string;
+  panelTokenIssuer: string;
+  panelTokenKeys: PanelTokenKeys;
   mfaEncryptionKey: Buffer;
   allowedOrigins: string[];
   allowTestBootstrap: boolean;
+  exposeApiDocs: boolean;
 }
 
 function parseBoolean(source: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
@@ -27,39 +31,59 @@ function parseBoolean(source: NodeJS.ProcessEnv, name: string, fallback: boolean
   throw new Error(`${name} must be true or false`);
 }
 
+function parsePositiveInt(source: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = source[name];
+  if (raw === undefined || raw === '') {
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
 export function loadEnv(source: NodeJS.ProcessEnv = process.env): CoreEnv {
   const nodeEnv = source.NODE_ENV ?? 'development';
+  const production = nodeEnv === 'production';
   const allowTestBootstrap = parseBoolean(source, 'ALLOW_TEST_BOOTSTRAP', false);
-  if (nodeEnv === 'production' && allowTestBootstrap) {
+  if (production && allowTestBootstrap) {
     throw new Error('ALLOW_TEST_BOOTSTRAP cannot be enabled in production');
   }
-  const cookieSecure = parseBoolean(source, 'COOKIE_SECURE', nodeEnv === 'production');
-  if (nodeEnv === 'production' && !cookieSecure) {
+  const cookieSecure = parseBoolean(source, 'COOKIE_SECURE', production);
+  if (production && !cookieSecure) {
     throw new Error('COOKIE_SECURE must be true in production');
+  }
+  const exposeApiDocs = parseBoolean(source, 'EXPOSE_API_DOCS', !production);
+  if (production && exposeApiDocs) {
+    throw new Error('EXPOSE_API_DOCS cannot be enabled in production');
   }
   const keyHex = requiredFrom(source, 'MFA_ENCRYPTION_KEY');
   if (!/^[0-9a-fA-F]{64}$/.test(keyHex)) {
     throw new Error('MFA_ENCRYPTION_KEY must be 32 bytes of hex');
   }
-  const jwtSecret = requiredFrom(source, 'JWT_SECRET');
-  if (jwtSecret.length < 32) {
-    throw new Error('JWT_SECRET must be at least 32 characters');
-  }
+  // Secret stores often hold PEM on one line with literal \n separators.
+  const panelTokenKeys = loadPanelTokenKeys(requiredFrom(source, 'PANEL_TOKEN_PRIVATE_KEY').replace(/\\n/g, '\n'));
   const origins = requiredFrom(source, 'ALLOWED_ORIGINS')
     .split(',')
     .map((item) => item.trim())
     .filter((item) => item.length > 0);
+  if (production && origins.some((origin) => !origin.startsWith('https://'))) {
+    throw new Error('ALLOWED_ORIGINS must use https in production');
+  }
   return {
     nodeEnv,
-    port: Number(source.PORT ?? '3000'),
+    port: parsePositiveInt(source, 'PORT', 3000),
     databaseUrl: requiredFrom(source, 'DATABASE_URL'),
     cookieSecure,
-    sessionTtlSeconds: Number(source.SESSION_TTL_SECONDS ?? '900'),
-    panelTokenTtlSeconds: Number(source.PANEL_TOKEN_TTL_SECONDS ?? '300'),
-    jwtSecret,
+    sessionTtlSeconds: parsePositiveInt(source, 'SESSION_TTL_SECONDS', 900),
+    panelTokenTtlSeconds: parsePositiveInt(source, 'PANEL_TOKEN_TTL_SECONDS', 300),
+    panelTokenIssuer: source.PANEL_TOKEN_ISSUER ?? 'bluejet-platform-core',
+    panelTokenKeys,
     mfaEncryptionKey: Buffer.from(keyHex, 'hex'),
     allowedOrigins: origins,
     allowTestBootstrap,
+    exposeApiDocs,
   };
 }
 
@@ -75,7 +99,7 @@ export function assertProductionSafe(env: CoreEnv): void {
   if (env.nodeEnv !== 'production') {
     return;
   }
-  if (!env.cookieSecure || env.allowTestBootstrap) {
-    throw new Error('Production cookie and bootstrap flags are unsafe');
+  if (!env.cookieSecure || env.allowTestBootstrap || env.exposeApiDocs) {
+    throw new Error('Production cookie, bootstrap and API docs flags are unsafe');
   }
 }

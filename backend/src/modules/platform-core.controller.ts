@@ -1,7 +1,7 @@
-import { BadRequestException, Body, Controller, ForbiddenException, Get, Headers, Param, Post, Req, Res, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Headers, Param, Post, Req, Res, UnauthorizedException } from '@nestjs/common';
 import { ApiOperation, ApiProperty, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
-import { IsIn, IsInt, IsOptional, IsString, IsUUID, Max, Min, MinLength } from 'class-validator';
+import { IsIn, IsInt, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, MinLength } from 'class-validator';
 import { Request, Response } from 'express';
 import { ErrorCode } from '../common/errors';
 import { csrfCookieName } from '../common/crypto';
@@ -32,28 +32,31 @@ class LoginDto {
 
 class RegisterPanelDto {
   @ApiProperty({ example: 'crew' })
-  @IsString()
-  @MinLength(2)
+  @Matches(/^[a-z][a-z0-9-]{1,62}$/)
   code!: string;
 
   @ApiProperty({ example: 'crew-service' })
-  @IsString()
+  @Matches(/^[a-z][a-z0-9-]{1,62}$/)
   ownerService!: string;
 
-  @ApiProperty({ example: 'INTERNAL' })
-  @IsString()
+  @ApiProperty({ example: 'INTERNAL', enum: ['PUBLIC', 'INTERNAL', 'CONFIDENTIAL', 'RESTRICTED'] })
+  @IsIn(['PUBLIC', 'INTERNAL', 'CONFIDENTIAL', 'RESTRICTED'])
   classification!: string;
 
   @ApiProperty({ example: 'خدمه' })
   @IsString()
+  @MinLength(1)
+  @MaxLength(120)
   titleFa!: string;
 
   @ApiProperty({ example: 'Crew' })
   @IsString()
+  @MinLength(1)
+  @MaxLength(120)
   titleEn!: string;
 
   @ApiProperty({ example: 'panel:crew' })
-  @IsString()
+  @Matches(/^panel:[a-z][a-z0-9-]{1,62}$/)
   audience!: string;
 }
 
@@ -75,19 +78,23 @@ class GatewayDecisionDto {
   @ApiProperty({ example: '/v1/flights/{id}/operations' })
   @IsString()
   pathPattern!: string;
+
+  @ApiProperty({ example: 'v1' })
+  @Matches(/^v\d+$/)
+  version!: string;
 }
 
 class StartWorkflowDto {
   @ApiProperty({ example: 'commerce.order.v1' })
-  @IsString()
+  @Matches(/^[a-z][a-z0-9.-]{1,120}$/)
   definitionKey!: string;
 
   @ApiProperty({ example: 'commerce' })
-  @IsString()
+  @Matches(/^[a-z][a-z0-9-]{1,62}$/)
   ownerService!: string;
 
   @ApiProperty({ example: 'corr-1' })
-  @IsString()
+  @Matches(/^[A-Za-z0-9._:-]{1,128}$/)
   correlationId!: string;
 }
 
@@ -103,7 +110,7 @@ class ConsentDto {
   purpose!: 'ANALYTICS' | 'ADVERTISING';
 
   @ApiProperty({ example: '2026-09-01' })
-  @IsString()
+  @Matches(/^[A-Za-z0-9._-]{1,40}$/)
   policyVersion!: string;
 
   @ApiProperty({ example: 'GRANTED', enum: ['GRANTED', 'WITHDRAWN'] })
@@ -145,6 +152,8 @@ class RegisterRouteDto {
 
 type AuthedRequest = Request & { principal?: AuthenticatedPrincipal; id?: string };
 
+const IDEMPOTENCY_KEY = /^[A-Za-z0-9_-]{8,128}$/;
+
 @ApiTags('platform-core')
 @Controller()
 export class PlatformCoreController {
@@ -153,7 +162,11 @@ export class PlatformCoreController {
   @Post('v1/sessions')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: 'ورود و صدور کوکی نشست میزبان' })
-  async login(@Body() dto: LoginDto, @Res({ passthrough: true }) res: Response) {
+  async login(@Req() req: Request, @Body() dto: LoginDto, @Res({ passthrough: true }) res: Response) {
+    // Browsers always send Origin on a cross-site POST; reject login CSRF from unknown sites.
+    if (req.header('origin') !== undefined) {
+      this.assertOrigin(req);
+    }
     const opened = await this.core.login(dto);
     this.writeCookies(res, opened.sessionToken, opened.csrfToken);
     return { success: true, data: { principalId: opened.principal.id, realm: opened.principal.realm, csrfToken: opened.csrfToken } };
@@ -162,9 +175,8 @@ export class PlatformCoreController {
   @Post('v1/sessions/logout')
   @ApiOperation({ summary: 'خروج و ابطال نشست' })
   async logout(@Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response) {
-    const actor = await this.actor(req);
+    const actor = await this.requireMutation(req);
     const token = this.sessionToken(req);
-    await this.core.assertCsrf(token, this.csrfHeader(req));
     await this.core.logout(token, actor.id, this.correlation(req));
     this.clearCookies(res);
     return { success: true, data: { revoked: true } };
@@ -173,9 +185,8 @@ export class PlatformCoreController {
   @Post('v1/sessions/rotate')
   @ApiOperation({ summary: 'چرخش نشست پس از ورود یا تغییر امتیاز' })
   async rotate(@Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response) {
-    const actor = await this.actor(req);
+    const actor = await this.requireMutation(req);
     const token = this.sessionToken(req);
-    await this.core.assertCsrf(token, this.csrfHeader(req));
     const opened = await this.core.rotate(token, actor.id, this.correlation(req));
     this.writeCookies(res, opened.sessionToken, opened.csrfToken);
     return { success: true, data: { rotated: true, csrfToken: opened.csrfToken } };
@@ -206,10 +217,7 @@ export class PlatformCoreController {
     @Headers('idempotency-key') idempotencyKey?: string,
   ) {
     const actor = await this.requireMutation(req);
-    if (!idempotencyKey) {
-      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'کلید تکرار الزامی است.' });
-    }
-    const panel = await this.core.registerPanel(actor, dto, idempotencyKey, this.correlation(req));
+    const panel = await this.core.registerPanel(actor, dto, this.idempotencyKey(idempotencyKey), this.correlation(req));
     return { success: true, data: { id: panel.id, code: panel.code, audience: panel.audience } };
   }
 
@@ -233,28 +241,32 @@ export class PlatformCoreController {
   @ApiOperation({ summary: 'ثبت قرارداد مسیر درگاه' })
   async registerRoute(@Req() req: AuthedRequest, @Body() dto: RegisterRouteDto) {
     const actor = await this.requireMutation(req);
-    if (actor.role !== 'PLATFORM_ADMIN' || actor.realm !== 'STAFF') {
-      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'این عملیات فقط برای مدیر سکو مجاز است.' });
-    }
-    const route = await this.core.registerRoute({
-      ...dto,
-      allowedRealms: dto.allowedRealms.split(',').map((item) => item.trim()),
-    });
+    const route = await this.core.registerRoute(
+      actor,
+      { ...dto, allowedRealms: dto.allowedRealms.split(',').map((item) => item.trim()) },
+      this.correlation(req),
+    );
     return { success: true, data: { id: route.id, audience: route.audience, timeoutMs: route.timeoutMs } };
   }
 
   @Post('v1/gateway/decisions')
   @ApiOperation({ summary: 'تصمیم مجوز مسیر بر اساس مخاطب توکن' })
   async decide(@Req() req: Request, @Body() dto: GatewayDecisionDto) {
-    const data = await this.core.decideRoute(req.header('authorization'), dto.method, dto.pathPattern);
+    const data = await this.core.decideRoute(req.header('authorization'), dto);
     return { success: true, data };
+  }
+
+  @Get('.well-known/jwks.json')
+  @ApiOperation({ summary: 'کلید عمومی امضای توکن پنل برای درگاه و سرویس‌ها' })
+  jwks() {
+    return this.core.panelTokenJwks();
   }
 
   @Post('v1/gateway/routes/:id/probe')
   @ApiOperation({ summary: 'سنجش مهلت سرویس بالادست بدون ذخیره پاسخ کسب‌وکار' })
   async probe(@Req() req: AuthedRequest, @Param('id') id: string) {
-    await this.requireMutation(req);
-    const data = await this.core.probeUpstream(id);
+    const actor = await this.requireMutation(req);
+    const data = await this.core.probeUpstream(actor, id);
     return { success: true, data };
   }
 
@@ -266,10 +278,7 @@ export class PlatformCoreController {
     @Headers('idempotency-key') idempotencyKey?: string,
   ) {
     const actor = await this.requireMutation(req);
-    if (!idempotencyKey) {
-      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'کلید تکرار الزامی است.' });
-    }
-    const run = await this.core.startWorkflow(actor, dto, idempotencyKey);
+    const run = await this.core.startWorkflow(actor, dto, this.idempotencyKey(idempotencyKey));
     return { success: true, data: { id: run.id, status: run.status, ownerService: run.ownerService } };
   }
 
@@ -326,6 +335,13 @@ export class PlatformCoreController {
     return this.core.authenticate(token);
   }
 
+  private idempotencyKey(value: string | undefined): string {
+    if (!value || !IDEMPOTENCY_KEY.test(value)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'کلید تکرار الزامی است (۸ تا ۱۲۸ نویسه).' });
+    }
+    return value;
+  }
+
   private sessionToken(req: Request): string {
     const policy = this.core.sessionPolicy();
     const token = req.cookies?.[policy.name] as string | undefined;
@@ -369,8 +385,9 @@ export class PlatformCoreController {
   }
 
   private clearCookies(res: Response): void {
+    // __Host- cookies are only replaced (and so cleared) by a Set-Cookie that also carries Secure.
     const policy = this.core.sessionPolicy();
-    res.clearCookie(policy.name, { path: '/' });
-    res.clearCookie(csrfCookieName(policy.secure), { path: '/' });
+    res.clearCookie(policy.name, { httpOnly: true, secure: policy.secure, sameSite: 'lax', path: '/' });
+    res.clearCookie(csrfCookieName(policy.secure), { httpOnly: false, secure: policy.secure, sameSite: 'lax', path: '/' });
   }
 }

@@ -1,9 +1,14 @@
-import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus } from '@nestjs/common';
+import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import { Response } from 'express';
+import { QueryFailedError } from 'typeorm';
 import { ErrorCode } from '../errors';
+
+const UNIQUE_VIOLATION = '23505';
 
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
+  private readonly logger = new Logger(AllExceptionsFilter.name);
+
   catch(exception: unknown, host: ArgumentsHost): void {
     const response = host.switchToHttp().getResponse<Response>();
     if (exception instanceof HttpException) {
@@ -22,6 +27,14 @@ export class AllExceptionsFilter implements ExceptionFilter {
       });
       return;
     }
+    if (exception instanceof QueryFailedError && (exception.driverError as { code?: string } | undefined)?.code === UNIQUE_VIOLATION) {
+      response.status(HttpStatus.CONFLICT).json({
+        success: false,
+        error: { code: ErrorCode.CONFLICT, message: 'این رکورد از قبل وجود دارد.' },
+      });
+      return;
+    }
+    this.logger.error(exception instanceof Error ? exception.message : 'unknown error');
     response.status(HttpStatus.INTERNAL_SERVER_ERROR).json({
       success: false,
       error: { code: ErrorCode.INTERNAL, message: 'خطای داخلی رخ داد.' },

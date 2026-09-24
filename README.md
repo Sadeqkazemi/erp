@@ -12,13 +12,14 @@ PostgreSQL 16+ is required. Create a database and two roles (runtime and migrati
 
 ```bash
 cd backend
-cp .env.example .env
+cp .env.example .env            # then set PANEL_TOKEN_PRIVATE_KEY
 npm install
-npm run migration:run
-npm run start
+psql -v db=platform_core -v migration_password=... -v runtime_password=... -f scripts/provision-roles.sql
+npm run migration:run           # uses DATABASE_MIGRATION_URL
+npm run start                   # uses DATABASE_URL (runtime role)
 ```
 
-Health: `GET /health`. API docs: `GET /docs`.
+Health: `GET /health`. API docs: `GET /docs` (not served in production). Panel token keys: `GET /.well-known/jwks.json`.
 
 ## Tests
 
@@ -29,4 +30,4 @@ npm run lint
 npm run typecheck
 ```
 
-On Windows the end-to-end test starts a throwaway PostgreSQL cluster with the local `initdb` at `POSTGRES_BIN` (default `C:\Program Files\PostgreSQL\18\bin`).
+Set `PLATFORM_CORE_TEST_DATABASE_URL` (and optionally `PLATFORM_CORE_TEST_MIGRATION_DATABASE_URL`) to test against an existing database. Otherwise the end-to-end test starts a throwaway PostgreSQL cluster with `initdb` from `POSTGRES_BIN` (default `C:\Program Files\PostgreSQL\18\bin`).

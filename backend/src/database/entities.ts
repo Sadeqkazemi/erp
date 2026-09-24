@@ -1,4 +1,4 @@
-import { Column, CreateDateColumn, Entity, Index, PrimaryColumn, UpdateDateColumn } from 'typeorm';
+import { Column, CreateDateColumn, Entity, Index, PrimaryColumn, UpdateDateColumn, VersionColumn } from 'typeorm';
 
 @Entity({ name: 'principals' })
 @Index(['realm', 'username'], { unique: true })
@@ -23,6 +23,9 @@ export class PrincipalEntity {
 
   @Column({ type: 'varchar', default: 'ACTIVE' })
   status!: 'ACTIVE' | 'DISABLED';
+
+  @Column({ type: 'bigint', nullable: true })
+  lastTotpStep!: string | null;
 
   @CreateDateColumn({ type: 'timestamptz' })
   createdAt!: Date;
@@ -139,6 +142,7 @@ export class RouteContractEntity {
 }
 
 @Entity({ name: 'workflow_runs' })
+@Index(['startedByPrincipalId', 'idempotencyKey'], { unique: true })
 export class WorkflowRunEntity {
   @PrimaryColumn('uuid')
   id!: string;
@@ -158,8 +162,14 @@ export class WorkflowRunEntity {
   @Column({ type: 'int', default: 0 })
   attempt!: number;
 
-  @Column({ type: 'varchar', unique: true })
+  @Column({ type: 'varchar' })
   idempotencyKey!: string;
+
+  @Column({ type: 'uuid', nullable: true })
+  startedByPrincipalId!: string | null;
+
+  @VersionColumn()
+  version!: number;
 
   @Column({ type: 'timestamptz', nullable: true })
   nextTimerAt!: Date | null;
@@ -215,6 +225,12 @@ export class OutboxEventEntity {
   @Column({ type: 'timestamptz', nullable: true })
   publishedAt!: Date | null;
 
+  @Column({ type: 'int', default: 0 })
+  attempts!: number;
+
+  @Column({ type: 'varchar', nullable: true })
+  lastError!: string | null;
+
   @CreateDateColumn({ type: 'timestamptz' })
   createdAt!: Date;
 }
@@ -241,8 +257,18 @@ export class ConsentRecordEntity {
 }
 
 @Entity({ name: 'idempotency_records' })
+@Index(['principalId', 'scope', 'key'], { unique: true })
 export class IdempotencyRecordEntity {
-  @PrimaryColumn({ type: 'varchar' })
+  @PrimaryColumn('uuid')
+  id!: string;
+
+  @Column({ type: 'uuid', nullable: true })
+  principalId!: string | null;
+
+  @Column({ type: 'varchar' })
+  scope!: string;
+
+  @Column({ type: 'varchar' })
   key!: string;
 
   @Column({ type: 'varchar' })

@@ -1,4 +1,16 @@
-import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto';
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  createHmac,
+  createPrivateKey,
+  createPublicKey,
+  KeyObject,
+  randomBytes,
+  sign,
+  timingSafeEqual,
+  verify,
+} from 'crypto';
 
 const BASE32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
@@ -97,7 +109,7 @@ export function generateTotpSecret(): string {
 }
 
 export function totpCode(secret: string, at: Date, stepSeconds = 30): string {
-  const counter = Math.floor(at.getTime() / 1000 / stepSeconds);
+  const counter = totpStep(at, stepSeconds);
   const counterBytes = Buffer.alloc(8);
   counterBytes.writeBigUInt64BE(BigInt(counter));
   const digest = createHmac('sha1', base32Decode(secret)).update(counterBytes).digest();
@@ -109,43 +121,81 @@ export function totpCode(secret: string, at: Date, stepSeconds = 30): string {
   return String(binary % 1_000_000).padStart(6, '0');
 }
 
-export function verifyTotp(secret: string, code: string, at: Date): boolean {
-  const trimmed = code.trim();
-  if (!/^\d{6}$/.test(trimmed)) {
-    return false;
-  }
-  for (const skew of [-30_000, 0, 30_000]) {
-    const expected = totpCode(secret, new Date(at.getTime() + skew));
-    const a = Buffer.from(expected);
-    const b = Buffer.from(trimmed);
-    if (a.length === b.length && timingSafeEqual(a, b)) {
-      return true;
-    }
-  }
-  return false;
+export function totpStep(at: Date, stepSeconds = 30): number {
+  return Math.floor(at.getTime() / 1000 / stepSeconds);
 }
 
-export function signPanelToken(payload: Record<string, string | number>, secret: string): string {
-  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+/**
+ * Returns the matched time step so callers can reject reuse of the same code,
+ * or null when the code does not match the current step or one step either side.
+ */
+export function verifyTotp(secret: string, code: string, at: Date): number | null {
+  const trimmed = code.trim();
+  if (!/^\d{6}$/.test(trimmed)) {
+    return null;
+  }
+  for (const skew of [-30_000, 0, 30_000]) {
+    const when = new Date(at.getTime() + skew);
+    const a = Buffer.from(totpCode(secret, when));
+    const b = Buffer.from(trimmed);
+    if (a.length === b.length && timingSafeEqual(a, b)) {
+      return totpStep(when);
+    }
+  }
+  return null;
+}
+
+export interface PanelTokenKeys {
+  privateKey: KeyObject;
+  publicKey: KeyObject;
+  kid: string;
+}
+
+export function loadPanelTokenKeys(privateKeyPem: string): PanelTokenKeys {
+  const privateKey = createPrivateKey(privateKeyPem);
+  if (privateKey.asymmetricKeyType !== 'ed25519') {
+    throw new Error('PANEL_TOKEN_PRIVATE_KEY must be an Ed25519 private key');
+  }
+  const publicKey = createPublicKey(privateKey);
+  const jwk = publicKey.export({ format: 'jwk' });
+  const kid = createHash('sha256').update(JSON.stringify({ crv: jwk.crv, kty: jwk.kty, x: jwk.x })).digest('base64url');
+  return { privateKey, publicKey, kid };
+}
+
+export function panelTokenJwks(keys: PanelTokenKeys): { keys: Record<string, unknown>[] } {
+  const jwk = keys.publicKey.export({ format: 'jwk' });
+  return { keys: [{ ...jwk, kid: keys.kid, alg: 'EdDSA', use: 'sig' }] };
+}
+
+export function signPanelToken(payload: Record<string, string | number>, keys: PanelTokenKeys): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'EdDSA', typ: 'JWT', kid: keys.kid })).toString('base64url');
   const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
-  const signature = createHmac('sha256', secret).update(`${header}.${body}`).digest('base64url');
+  const signature = sign(null, Buffer.from(`${header}.${body}`), keys.privateKey).toString('base64url');
   return `${header}.${body}.${signature}`;
 }
 
-export function verifyPanelToken(token: string, secret: string, nowSeconds: number): Record<string, string | number> {
+export function verifyPanelToken(
+  token: string,
+  keys: PanelTokenKeys,
+  expected: { issuer: string; nowSeconds: number },
+): Record<string, string | number> {
   const parts = token.split('.');
   if (parts.length !== 3) {
     throw new Error('malformed token');
   }
-  const signature = createHmac('sha256', secret).update(`${parts[0]}.${parts[1]}`).digest('base64url');
-  const expected = Buffer.from(signature);
-  const actual = Buffer.from(parts[2]);
-  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
+  const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')) as Record<string, unknown>;
+  if (header.alg !== 'EdDSA' || header.kid !== keys.kid) {
+    throw new Error('unexpected token header');
+  }
+  if (!verify(null, Buffer.from(`${parts[0]}.${parts[1]}`), keys.publicKey, Buffer.from(parts[2], 'base64url'))) {
     throw new Error('bad signature');
   }
   const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as Record<string, string | number>;
+  if (payload.iss !== expected.issuer) {
+    throw new Error('wrong issuer');
+  }
   const exp = payload.exp;
-  if (typeof exp !== 'number' || exp <= nowSeconds) {
+  if (typeof exp !== 'number' || exp <= expected.nowSeconds) {
     throw new Error('expired');
   }
   return payload;
