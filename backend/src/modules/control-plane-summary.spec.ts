@@ -22,11 +22,11 @@ describe('control-plane summary', () => {
     query.mockResolvedValueOnce([{ total: 4, active: 3 }])
       .mockResolvedValueOnce([{ total: 2 }])
       .mockResolvedValueOnce([{ status: 'RUNNING', count: 1 }])
-      .mockResolvedValueOnce([{ pending: 1, retried: 1, oldestAgeSeconds: 34 }])
+      .mockResolvedValueOnce([{ pending: 1, retried: 1, deadLetters: 0, oldestAgeSeconds: 34, oldestDeadLetterAgeSeconds: null }])
       .mockResolvedValueOnce([{ day: '2026-09-24', count: 5 }]);
     const result = await core.controlPlaneSummary(actor);
     expect(result.panels).toEqual({ total: 4, active: 3 });
-    expect(result.outbox).toEqual({ pending: 1, retried: 1, oldestAgeSeconds: 34 });
+    expect(result.outbox).toEqual({ pending: 1, retried: 1, deadLetters: 0, oldestAgeSeconds: 34, oldestDeadLetterAgeSeconds: null });
     expect(result.domainSales).toEqual({ status: 'UNCONFIGURED' });
   });
 });

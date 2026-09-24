@@ -27,6 +27,7 @@
 - [x] Audit log is append-only in the database — e2e `keeps the audit log append-only`
 - [x] Parallel outbox dispatchers do not concurrently claim the same row — e2e `never dispatches the same outbox row twice`
 - [x] The publisher retains unacknowledged rows on broker errors and retries after recovery — e2e `keeps unacknowledged events pending`
+- [x] Bounded retry and durable dead-letter state after eight failures, admin-only inspection and audited replay with the same event ID — `outbox-recovery.e2e-spec.ts`
 - [x] Admin-only control-plane summary reports real panel/workflow/audit/outbox counts; domain sales is explicitly unconfigured until its owning API exists.
 - [x] Migrations run only with the migration role; CI tests as the least-privilege runtime role — `.github/workflows/ci.yml`
 - [x] NestJS 11 (Express 5); `npm audit` reports no advisories and CI fails on any high or critical finding — `.github/workflows/ci.yml`
@@ -35,7 +36,7 @@
 
 - [x] Agency identity lookup uses explicit tenant UUID; audit records carry tenant ID, and unmapped legacy agency identities cannot log in (`agency-scope.spec.ts`). Still required: authoritative agency registry/backfill, tenant-scoped panel entitlements, gateway/domain object policy and cross-agency end-to-end denial tests.
 - SSO (OIDC) with phishing-resistant MFA for staff instead of local password + TOTP (diagram 49).
-- Provision a durable HTTP broker ingress, dead-letter handling and outbox lag alerts. Configure `OUTBOX_PUBLISH_URL` and `OUTBOX_PUBLISH_TOKEN` before production startup. The ingress MUST acknowledge only after durable broker acceptance, and deduplicate on `eventId`; otherwise a 2xx response can lose an event. Retries are at-least-once.
+- Provision a durable HTTP broker ingress and external outbox lag/dead-letter alerts. Configure `OUTBOX_PUBLISH_URL` and `OUTBOX_PUBLISH_TOKEN` before production startup. The ingress MUST acknowledge only after durable broker acceptance, and deduplicate on `eventId`; otherwise a 2xx response can lose an event. Retries are at-least-once.
 - [x] Workflow step status and deadlines persist; due-step scanner marks failures, moves runs into failure/compensation, and blocks premature completion (`workflow-steps.e2e-spec.ts`). Remaining: registered workflow definitions, authenticated domain callbacks, actual compensation commands/evidence, retries, and end-to-end domain reconciliation.
 - [x] Anonymous visitor consent API before login; origin-checked POST, HttpOnly opaque cookie, stored hash, default denial and withdrawal (`visitor-consent.spec.ts`). Website integration must gate optional scripts, surface policy versions, and define retention before rollout.
 - SAST, SBOM, signed image and artifact attestation in CI (rules §6).

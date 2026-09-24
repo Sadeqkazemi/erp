@@ -264,6 +264,12 @@ export class OutboxEventEntity {
   @Column({ type: 'varchar', nullable: true })
   lastError!: string | null;
 
+  @Column({ type: 'timestamptz', nullable: true })
+  nextAttemptAt!: Date | null;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  deadLetterAt!: Date | null;
+
   @CreateDateColumn({ type: 'timestamptz' })
   createdAt!: Date;
 }

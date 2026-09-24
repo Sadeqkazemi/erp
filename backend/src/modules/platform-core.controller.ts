@@ -410,6 +410,21 @@ export class PlatformCoreController {
     return { success: true, data: await this.core.controlPlaneSummary(actor) };
   }
 
+  @Get('v1/outbox/dead-letters')
+  @ApiOperation({ summary: 'رویدادهای متوقف‌شده پس از شکست‌های مکرر، بدون نمایش payload' })
+  async deadLetters(@Req() req: AuthedRequest) {
+    const actor = await this.actor(req);
+    return { success: true, data: await this.core.listDeadLetters(actor) };
+  }
+
+  @Post('v1/outbox/dead-letters/:id/requeue')
+  @ApiOperation({ summary: 'ارسال مجدد رویداد پس از بررسی علت شکست' })
+  async requeueDeadLetter(@Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string) {
+    const actor = await this.requireMutation(req);
+    const event = await this.core.requeueDeadLetter(actor, id, this.correlation(req));
+    return { success: true, data: { id: event.id, eventId: event.eventId, status: 'PENDING' } };
+  }
+
   private async actor(req: AuthedRequest): Promise<AuthenticatedPrincipal> {
     const token = this.sessionToken(req);
     return this.core.authenticate(token);

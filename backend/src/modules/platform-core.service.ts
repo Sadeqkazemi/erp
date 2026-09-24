@@ -1,5 +1,5 @@
 import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
-import { DataSource, EntityManager, In, LessThanOrEqual } from 'typeorm';
+import { DataSource, EntityManager, In, IsNull, LessThanOrEqual, Not } from 'typeorm';
 import { randomUUID } from 'crypto';
 import * as argon2 from 'argon2';
 import { ErrorCode } from '../common/errors';
@@ -35,6 +35,7 @@ import {
 } from '../database/entities';
 import { assertWorkflowTransition, WorkflowStatus } from './workflow/workflow-transitions';
 import { assertStepTransition, StepStatus } from './workflow/step-transitions';
+import { nextOutboxRetryAt } from './outbox/retry-policy';
 
 export interface AuthenticatedPrincipal {
   id: string;
@@ -849,9 +850,12 @@ export class PlatformCoreService {
         count(*) FILTER (WHERE status = 'ACTIVE')::int AS active FROM panels`),
       this.dataSource.query('SELECT count(*)::int AS total FROM route_contracts'),
       this.dataSource.query('SELECT status, count(*)::int AS count FROM workflow_runs GROUP BY status ORDER BY status'),
-      this.dataSource.query(`SELECT count(*)::int AS pending,
-        count(*) FILTER (WHERE attempts > 0)::int AS retried,
-        extract(epoch FROM (now() - min("createdAt")))::int AS "oldestAgeSeconds"
+      this.dataSource.query(`SELECT
+        count(*) FILTER (WHERE "deadLetterAt" IS NULL)::int AS pending,
+        count(*) FILTER (WHERE "deadLetterAt" IS NULL AND attempts > 0)::int AS retried,
+        count(*) FILTER (WHERE "deadLetterAt" IS NOT NULL)::int AS "deadLetters",
+        extract(epoch FROM (now() - min("createdAt") FILTER (WHERE "deadLetterAt" IS NULL)))::int AS "oldestAgeSeconds",
+        extract(epoch FROM (now() - min("deadLetterAt")))::int AS "oldestDeadLetterAgeSeconds"
         FROM outbox_events WHERE "publishedAt" IS NULL`),
       this.dataSource.query(`SELECT to_char(date_trunc('day', "createdAt" AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
         count(*)::int AS count FROM audit_events
@@ -866,6 +870,41 @@ export class PlatformCoreService {
     };
   }
 
+  async listDeadLetters(actor: AuthenticatedPrincipal): Promise<Array<{
+    id: string; eventId: string; eventName: string; aggregateId: string;
+    attempts: number; lastError: string | null; deadLetterAt: Date | null;
+  }>> {
+    this.requirePlatformAdmin(actor);
+    const events = await this.dataSource.getRepository(OutboxEventEntity).find({
+      where: { publishedAt: IsNull(), deadLetterAt: Not(IsNull()) },
+      order: { deadLetterAt: 'DESC' }, take: 100,
+    });
+    return events.map(({ id, eventId, eventName, aggregateId, attempts, lastError, deadLetterAt }) =>
+      ({ id, eventId, eventName, aggregateId, attempts, lastError, deadLetterAt }));
+  }
+
+  async requeueDeadLetter(actor: AuthenticatedPrincipal, id: string, correlationId: string): Promise<OutboxEventEntity> {
+    this.requirePlatformAdmin(actor);
+    return this.dataSource.transaction(async (manager) => {
+      const event = await manager.findOne(OutboxEventEntity, { where: { id }, lock: { mode: 'pessimistic_write' } });
+      if (!event) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'رویداد یافت نشد.' });
+      if (event.publishedAt || !event.deadLetterAt) {
+        throw new ConflictException({ code: ErrorCode.CONFLICT, message: 'رویداد در صف بررسی مجدد نیست.' });
+      }
+      event.deadLetterAt = null;
+      event.nextAttemptAt = null;
+      event.attempts = 0;
+      event.lastError = null;
+      await manager.save(event);
+      await this.appendControl(manager, {
+        actorId: actor.id, action: 'outbox.dead_letter.requeued', objectType: 'outbox_event', objectId: event.id,
+        correlationId, eventName: 'core.outbox.dead_letter.requeued.v1',
+        payload: { outboxEventId: event.id, eventId: event.eventId },
+      });
+      return event;
+    });
+  }
+
   /**
    * Claims a batch with SKIP LOCKED so parallel dispatchers never deliver the same row twice,
    * marks each row published only after the publisher accepts it, and records failures for retry.
@@ -878,7 +917,8 @@ export class PlatformCoreService {
         .createQueryBuilder(OutboxEventEntity, 'event')
         .setLock('pessimistic_write')
         .setOnLocked('skip_locked')
-        .where('event.publishedAt IS NULL')
+        .where('event.publishedAt IS NULL AND event.deadLetterAt IS NULL')
+        .andWhere('(event.nextAttemptAt IS NULL OR event.nextAttemptAt <= now())')
         .orderBy('event.createdAt', 'ASC')
         .limit(OUTBOX_BATCH)
         .getMany();
@@ -893,9 +933,14 @@ export class PlatformCoreService {
           });
           event.publishedAt = new Date();
           event.lastError = null;
+          event.nextAttemptAt = null;
           count += 1;
         } catch (error) {
           event.lastError = error instanceof Error ? error.message.slice(0, 500) : 'publish failed';
+          const now = new Date();
+          const next = nextOutboxRetryAt(event.attempts + 1, now);
+          event.nextAttemptAt = next;
+          if (!next) event.deadLetterAt = now;
         }
         event.attempts += 1;
         await manager.save(event);
@@ -1074,10 +1119,12 @@ export class PlatformCoreService {
     await manager.save(OutboxEventEntity, {
       id: randomUUID(),
       eventId: randomUUID(),
-      eventName: input.eventName,
-      aggregateId: input.objectId,
-      payload: input.payload,
-      publishedAt: null,
+        eventName: input.eventName,
+        aggregateId: input.objectId,
+        payload: input.payload,
+        publishedAt: null,
+        nextAttemptAt: null,
+        deadLetterAt: null,
     });
   }
 

@@ -18,6 +18,7 @@ import { PlatformCoreHardening1710000000001 } from './migrations/1710000000001-P
 import { VisitorConsent1710000000002 } from './migrations/1710000000002-VisitorConsent';
 import { AgencyTenant1710000000003 } from './migrations/1710000000003-AgencyTenant';
 import { WorkflowSteps1710000000004 } from './migrations/1710000000004-WorkflowSteps';
+import { OutboxRecovery1710000000005 } from './migrations/1710000000005-OutboxRecovery';
 
 export const coreEntities = [
   PrincipalEntity,
@@ -42,7 +43,7 @@ export function createDataSource(databaseUrl = process.env.DATABASE_URL): DataSo
     type: 'postgres',
     url: databaseUrl,
     entities: coreEntities,
-    migrations: [PlatformCoreFoundation1710000000000, PlatformCoreHardening1710000000001, VisitorConsent1710000000002, AgencyTenant1710000000003, WorkflowSteps1710000000004],
+    migrations: [PlatformCoreFoundation1710000000000, PlatformCoreHardening1710000000001, VisitorConsent1710000000002, AgencyTenant1710000000003, WorkflowSteps1710000000004, OutboxRecovery1710000000005],
     synchronize: false,
   });
 }
