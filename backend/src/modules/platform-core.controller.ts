@@ -154,6 +154,26 @@ class TransitionWorkflowStepDto {
   to!: StepStatus;
 }
 
+class RegisterWorkloadIdentityDto {
+  @ApiProperty({ example: 'commerce-service', description: 'Registered owner-service slug' })
+  @Matches(/^[a-z][a-z0-9-]{1,62}$/)
+  service!: string;
+}
+
+class WorkflowStepCallbackDto {
+  @ApiProperty({ enum: ['SUCCEEDED', 'FAILED', 'COMPENSATED'], example: 'SUCCEEDED' })
+  @IsIn(['SUCCEEDED', 'FAILED', 'COMPENSATED'])
+  result!: 'SUCCEEDED' | 'FAILED' | 'COMPENSATED';
+
+  @ApiProperty({ example: 'pss:reservation:01K6EJAB8N7M3T5Z9P2W4Q6R8S', description: 'Opaque evidence reference owned by the domain service' })
+  @Matches(/^[A-Za-z0-9._:/-]{8,160}$/)
+  evidenceId!: string;
+
+  @ApiProperty({ example: '2026-09-24T10:20:30.000Z' })
+  @IsISO8601({ strict: true })
+  occurredAt!: string;
+}
+
 class ConsentDto {
   @ApiProperty({ example: 'ANALYTICS', enum: ['ANALYTICS', 'ADVERTISING'] })
   @IsIn(['ANALYTICS', 'ADVERTISING'])
@@ -357,6 +377,20 @@ export class PlatformCoreController {
     return { success: true, data: await this.core.disableStaffPrincipal(actor, id, this.correlation(req)) };
   }
 
+  @Post('v1/workload-identities')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({ summary: 'ثبت هویت کاری سرویس مالک توسط مدیر سکو؛ کلید خصوصی در هسته نگه‌داری نمی‌شود' })
+  async registerWorkloadIdentity(
+    @Req() req: AuthedRequest, @Body() dto: RegisterWorkloadIdentityDto,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    const actor = await this.requireMutation(req);
+    const identity = await this.core.registerWorkloadPrincipal(
+      actor, dto.service, this.idempotencyKey(idempotencyKey), this.correlation(req),
+    );
+    return { success: true, data: identity };
+  }
+
   @Post('v1/sessions/rotate')
   @ApiOperation({ summary: 'چرخش نشست پس از ورود یا تغییر امتیاز' })
   async rotate(@Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response) {
@@ -533,6 +567,21 @@ export class PlatformCoreController {
     const actor = await this.requireMutation(req);
     const step = await this.core.transitionWorkflowStep(actor, id, stepKey, dto.to, this.correlation(req));
     return { success: true, data: { id: step.id, stepKey: step.stepKey, status: step.status } };
+  }
+
+  @Post('v1/workflow-runs/:id/steps/:stepKey/callbacks')
+  @Throttle({ default: { limit: 120, ttl: 60_000 } })
+  @ApiOperation({ summary: 'ثبت نتیجه امضاشده گام توسط workload مالک و نگه‌داری ارجاع مدرک تغییرناپذیر' })
+  async workflowStepCallback(
+    @Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string,
+    @Param('stepKey') stepKey: string, @Body() dto: WorkflowStepCallbackDto,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    const workload = await this.core.authenticateWorkload(req.header('authorization'));
+    const result = await this.core.recordWorkflowStepCallback(
+      workload, id, stepKey, dto, this.idempotencyKey(idempotencyKey), this.correlation(req),
+    );
+    return { success: true, data: result };
   }
 
   @Post('v1/consents')

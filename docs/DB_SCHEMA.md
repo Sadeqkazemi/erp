@@ -20,6 +20,8 @@ Agency principals carry `tenantId` (UUID); staff and customers remain outside ag
 
 `workflow_steps` records an engine step key, status, attempt and UTC deadline under `workflow_runs`. Uniqueness is per run and step key. The timer records expiry in the same transaction as audit and outbox events; it does not call a business service or claim a business action was undone. Manual compensation status must reflect an actual owning-service operation and evidence before production use.
 
+`workflow_step_callbacks` (migration 0009) is append-only evidence for authenticated owning-service callbacks. It records the run/step, reporting `WORKLOAD` principal, terminal orchestration result, opaque domain-owned evidence reference, domain occurrence time, idempotency key and receipt time. A database trigger rejects UPDATE, DELETE and TRUNCATE. It never stores the referenced reservation, payment, maintenance or other domain record. Roll back migration 0009 only when no retained callback evidence is required and the callback endpoint is no longer receiving traffic.
+
 `outbox_events` also tracks `nextAttemptAt` and `deadLetterAt`. Failures use bounded exponential retry; after eight failed attempts the row is halted and remains durable for operator investigation. Replay preserves `eventId` for consumer deduplication and emits an audit/outbox control event.
 - `idempotency_records` — principal, scope (operation), key, request hash, stored response. Unique per principal, scope and key
 

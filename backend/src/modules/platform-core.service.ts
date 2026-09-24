@@ -8,6 +8,7 @@ import {
   Injectable,
   NotFoundException,
   PayloadTooLargeException,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { DataSource, EntityManager, In, IsNull, LessThanOrEqual, Not } from 'typeorm';
@@ -27,6 +28,7 @@ import {
   signPanelToken,
   totpCode,
   verifyPanelToken,
+  verifyWorkloadToken,
   verifyTotp,
 } from '../common/crypto';
 import { CORE_ENV, CoreEnv } from '../config/env';
@@ -46,6 +48,7 @@ import {
   WorkflowDefinitionEntity,
   WorkflowDefinitionStep,
   WorkflowStepEntity,
+  WorkflowStepCallbackEntity,
   VisitorConsentEntity,
 } from '../database/entities';
 import { assertWorkflowTransition, WorkflowStatus } from './workflow/workflow-transitions';
@@ -60,6 +63,12 @@ export interface AuthenticatedPrincipal {
   tenantId: string | null;
   sessionId: string;
   csrfToken: string;
+}
+
+export interface AuthenticatedWorkload {
+  id: string;
+  service: string;
+  tokenId: string;
 }
 
 const ARGON2_OPTIONS = { memoryCost: 19_456, timeCost: 2, parallelism: 1 } as const;
@@ -152,6 +161,12 @@ export class PlatformCoreService {
     totpSecret?: string;
     tenantId?: string;
   }): Promise<{ id: string; totpSecret: string | null }> {
+    if (input.realm === 'WORKLOAD') {
+      throw new BadRequestException({
+        code: ErrorCode.VALIDATION,
+        message: 'هویت کاری فقط از مسیر ثبت سرویس و بدون رمز عبور ساخته می‌شود.',
+      });
+    }
     if ((input.realm === 'AGENCY' && !input.tenantId) || (input.realm !== 'AGENCY' && input.tenantId)) {
       throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'شناسه آژانس برای هویت آژانس الزامی است.' });
     }
@@ -408,6 +423,55 @@ export class PlatformCoreService {
       }
       return { id: principal.id, status: 'DISABLED', revokedSessions: revoked.affected ?? 0 };
     });
+  }
+
+  async registerWorkloadPrincipal(
+    actor: AuthenticatedPrincipal, service: string, idempotencyKey: string, correlationId: string,
+  ) {
+    this.requirePlatformAdmin(actor);
+    if (!/^[a-z][a-z0-9-]{1,62}$/.test(service)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'شناسه سرویس نامعتبر است.' });
+    }
+    return this.dataSource.transaction(async (manager) =>
+      this.idempotent(manager, actor.id, 'workload.register', idempotencyKey, { service }, async () => {
+        const panel = await manager.findOne(PanelEntity, { where: { ownerService: service, status: 'ACTIVE' } });
+        if (!panel) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'سرویس فعال در رجیستری یافت نشد.' });
+        const existing = await manager.findOne(PrincipalEntity, { where: { realm: 'WORKLOAD', username: service } });
+        if (existing) throw new ConflictException({ code: ErrorCode.CONFLICT, message: 'هویت کاری سرویس قبلاً ثبت شده است.' });
+        const principal = await manager.save(PrincipalEntity, {
+          id: randomUUID(), realm: 'WORKLOAD', username: service, tenantId: null,
+          passwordHash: 'WORKLOAD_IDENTITY_ONLY', mfaSecretCiphertext: null,
+          role: 'MEMBER', status: 'ACTIVE', lastTotpStep: null,
+        });
+        await this.appendControl(manager, {
+          actorId: actor.id, action: 'workload.registered', objectType: 'principal', objectId: principal.id,
+          correlationId, eventName: 'identity.workload.registered.v1',
+          payload: { principalId: principal.id, service },
+        });
+        return { id: principal.id, service, status: principal.status };
+      }),
+    );
+  }
+
+  async authenticateWorkload(authorization: string | undefined): Promise<AuthenticatedWorkload> {
+    if (!this.env.workloadTokenVerifier) {
+      throw new ServiceUnavailableException({
+        code: ErrorCode.IDENTITY_UNAVAILABLE, message: 'اعتبارسنج هویت کاری پیکربندی نشده است.',
+      });
+    }
+    let claims: { sub: string; service: string; jti: string };
+    try {
+      claims = verifyWorkloadToken(
+        this.readBearer(authorization), this.env.workloadTokenVerifier, Math.floor(Date.now() / 1000),
+      );
+    } catch {
+      throw new UnauthorizedException({ code: ErrorCode.UNAUTHENTICATED, message: 'هویت کاری معتبر نیست.' });
+    }
+    const principal = await this.dataSource.getRepository(PrincipalEntity).findOne({ where: { id: claims.sub } });
+    if (!principal || principal.realm !== 'WORKLOAD' || principal.status !== 'ACTIVE' || principal.username !== claims.service) {
+      throw new UnauthorizedException({ code: ErrorCode.UNAUTHENTICATED, message: 'هویت کاری معتبر نیست.' });
+    }
+    return { id: principal.id, service: claims.service, tokenId: claims.jti };
   }
 
   async registerPanel(
@@ -935,6 +999,60 @@ export class PlatformCoreService {
       });
       return step;
     });
+  }
+
+  async recordWorkflowStepCallback(
+    workload: AuthenticatedWorkload, workflowRunId: string, stepKey: string,
+    input: { result: 'SUCCEEDED' | 'FAILED' | 'COMPENSATED'; evidenceId: string; occurredAt: string },
+    idempotencyKey: string, correlationId: string,
+  ) {
+    if (!/^[a-z][a-z0-9-]{1,62}$/.test(stepKey) || !/^[A-Za-z0-9._:/-]{8,160}$/.test(input.evidenceId)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'کلید گام یا شناسه مدرک نامعتبر است.' });
+    }
+    const occurredAt = new Date(input.occurredAt);
+    if (Number.isNaN(occurredAt.getTime()) || occurredAt.getTime() > Date.now() + 300_000) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'زمان رخداد مدرک نامعتبر است.' });
+    }
+    return this.dataSource.transaction(async (manager) =>
+      this.idempotent(manager, workload.id, `workflow.callback.${workflowRunId}.${stepKey}`, idempotencyKey, input, async () => {
+        const run = await manager.findOne(WorkflowRunEntity, {
+          where: { id: workflowRunId }, lock: { mode: 'pessimistic_write' },
+        });
+        if (!run) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'اجرای گردش‌کار یافت نشد.' });
+        if (run.ownerService !== workload.service) {
+          throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'هویت کاری مالک این گردش‌کار نیست.' });
+        }
+        const step = await manager.findOne(WorkflowStepEntity, {
+          where: { workflowRunId, stepKey }, lock: { mode: 'pessimistic_write' },
+        });
+        if (!step) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'گام گردش‌کار یافت نشد.' });
+        try {
+          assertStepTransition(step.status, input.result);
+        } catch {
+          throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'نتیجه Callback با وضعیت گام سازگار نیست.' });
+        }
+        if (input.result === 'COMPENSATED' && run.status !== 'COMPENSATING') {
+          throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'گردش‌کار در وضعیت جبران نیست.' });
+        }
+        if (input.result !== 'COMPENSATED' && run.status !== 'RUNNING' && run.status !== 'WAITING') {
+          throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'گردش‌کار فعال نیست.' });
+        }
+        const callback = await manager.save(WorkflowStepCallbackEntity, {
+          id: randomUUID(), workflowRunId, workflowStepId: step.id, reportedByPrincipalId: workload.id,
+          result: input.result, evidenceId: input.evidenceId, occurredAt, idempotencyKey,
+        });
+        const from = step.status;
+        step.status = input.result;
+        step.attempt += 1;
+        await manager.save(step);
+        await this.appendControl(manager, {
+          actorId: workload.id, action: 'workflow.step.callback_recorded', objectType: 'workflow_step_callback',
+          objectId: callback.id, correlationId, eventName: 'core.workflow.step.callback-recorded.v1',
+          payload: { workflowRunId, stepId: step.id, callbackId: callback.id, from, status: step.status, evidenceId: input.evidenceId },
+        });
+        return { callbackId: callback.id, workflowRunId, stepKey, status: step.status, evidenceId: input.evidenceId };
+      }),
+    );
   }
 
   async expireWorkflowSteps(): Promise<number> {

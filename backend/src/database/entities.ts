@@ -299,6 +299,37 @@ export class WorkflowStepEntity {
   updatedAt!: Date;
 }
 
+@Entity({ name: 'workflow_step_callbacks' })
+@Index(['reportedByPrincipalId', 'workflowRunId', 'workflowStepId', 'idempotencyKey'], { unique: true })
+export class WorkflowStepCallbackEntity {
+  @PrimaryColumn('uuid')
+  id!: string;
+
+  @Column('uuid')
+  workflowRunId!: string;
+
+  @Column('uuid')
+  workflowStepId!: string;
+
+  @Column('uuid')
+  reportedByPrincipalId!: string;
+
+  @Column({ type: 'varchar' })
+  result!: 'SUCCEEDED' | 'FAILED' | 'COMPENSATED';
+
+  @Column({ type: 'varchar' })
+  evidenceId!: string;
+
+  @Column({ type: 'timestamptz' })
+  occurredAt!: Date;
+
+  @Column({ type: 'varchar' })
+  idempotencyKey!: string;
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  receivedAt!: Date;
+}
+
 @Entity({ name: 'audit_events' })
 export class AuditEventEntity {
   @PrimaryColumn('uuid')

@@ -3,7 +3,7 @@ import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import cookieParser from 'cookie-parser';
 import { spawnSync } from 'child_process';
-import { generateKeyPairSync } from 'crypto';
+import { generateKeyPairSync, randomUUID } from 'crypto';
 import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -15,6 +15,7 @@ import { createDataSource } from '../src/database/data-source';
 import { PrincipalEntity } from '../src/database/entities';
 import { PlatformCoreService } from '../src/modules/platform-core.service';
 import { DataSource } from 'typeorm';
+import { loadPanelTokenKeys, panelTokenJwks, PanelTokenKeys, signPanelToken } from '../src/common/crypto';
 
 const postgresBin = process.env.POSTGRES_BIN ?? 'C:\\Program Files\\PostgreSQL\\18\\bin';
 const postgresPort = 55441;
@@ -36,6 +37,7 @@ describe('platform core', () => {
   const delivered = new Set<string>();
   const gatewayRequests: Array<Record<string, unknown>> = [];
   let brokerAvailable = true;
+  let workloadTokenKeys: PanelTokenKeys;
 
   beforeAll(async () => {
     broker = createServer((req, res) => {
@@ -127,6 +129,13 @@ describe('platform core', () => {
     process.env.NODE_ENV = 'test';
     process.env.COOKIE_SECURE = 'false';
     process.env.PANEL_TOKEN_PRIVATE_KEY = generateKeyPairSync('ed25519').privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
+    workloadTokenKeys = loadPanelTokenKeys(
+      generateKeyPairSync('ed25519').privateKey.export({ format: 'pem', type: 'pkcs8' }).toString(),
+    );
+    process.env.WORKLOAD_JWKS_JSON = JSON.stringify(panelTokenJwks(workloadTokenKeys));
+    process.env.WORKLOAD_TOKEN_ISSUER = 'https://identity.test';
+    process.env.WORKLOAD_TOKEN_AUDIENCE = 'bluejet-platform-core';
+    process.env.WORKLOAD_TOKEN_MAX_TTL_SECONDS = '300';
     process.env.MFA_ENCRYPTION_KEY = '11'.repeat(32);
     process.env.ALLOWED_ORIGINS = ORIGIN;
     process.env.SESSION_TTL_SECONDS = '900';
@@ -645,6 +654,80 @@ describe('platform core', () => {
       await decide(`${h}.${forged}.${sig}`).expect(401);
       await mutate(request(srv).post('/v1/sessions/logout'), staff).expect(201);
       await decide(token).expect(401);
+    });
+
+    it('authenticates the owning workload and records an immutable idempotent workflow callback', async () => {
+      const admin = await adminLogin();
+      const srv = app.getHttpServer();
+      await mutate(request(srv).post('/v1/panels'), admin)
+        .set('Idempotency-Key', 'panel-callback-01')
+        .send({
+          code: 'callback-test', ownerService: 'callback-service', classification: 'INTERNAL',
+          titleFa: 'آزمون بازگشت', titleEn: 'Callback test', audience: 'panel:callback-test',
+        })
+        .expect(201);
+      const registered = await mutate(request(srv).post('/v1/workload-identities'), admin)
+        .set('Idempotency-Key', 'workload-callback-01')
+        .send({ service: 'callback-service' })
+        .expect(201);
+
+      const started = await mutate(request(srv).post('/v1/workflow-runs'), admin)
+        .set('Idempotency-Key', 'wf-callback-0001')
+        .send({ definitionKey: 'callback.test.v1', ownerService: 'callback-service', correlationId: 'corr-callback-1' })
+        .expect(201);
+      const runId = started.body.data.id as string;
+      await mutate(request(srv).post(`/v1/workflow-runs/${runId}/transitions`), admin).send({ to: 'RUNNING' }).expect(201);
+      await mutate(request(srv).post(`/v1/workflow-runs/${runId}/steps`), admin)
+        .set('Idempotency-Key', 'step-callback-001')
+        .send({ stepKey: 'reserve', timeoutSeconds: 300 })
+        .expect(201);
+      await mutate(request(srv).post(`/v1/workflow-runs/${runId}/steps/reserve/transitions`), admin)
+        .send({ to: 'RUNNING' })
+        .expect(201);
+
+      const now = Math.floor(Date.now() / 1000);
+      const bearer = signPanelToken({
+        iss: 'https://identity.test', aud: 'bluejet-platform-core', sub: registered.body.data.id as string,
+        service: 'callback-service', jti: randomUUID(), iat: now, nbf: now, exp: now + 120,
+      }, workloadTokenKeys);
+      const callbackBody = {
+        result: 'SUCCEEDED', evidenceId: 'domain:evidence:callback-0001', occurredAt: new Date().toISOString(),
+      };
+      const sendCallback = (body = callbackBody) => request(srv)
+        .post(`/v1/workflow-runs/${runId}/steps/reserve/callbacks`)
+        .set('Authorization', `Bearer ${bearer}`)
+        .set('Idempotency-Key', 'callback-result-0001')
+        .send(body);
+      const first = await sendCallback().expect(201);
+      const replay = await sendCallback().expect(201);
+      expect(replay.body.data.callbackId).toBe(first.body.data.callbackId);
+      const mismatch = await sendCallback({ ...callbackBody, evidenceId: 'domain:evidence:callback-0002' }).expect(409);
+      expect(mismatch.body.error.code).toBe('IDEMPOTENCY_PAYLOAD_MISMATCH');
+
+      const foreignRun = await mutate(request(srv).post('/v1/workflow-runs'), admin)
+        .set('Idempotency-Key', 'wf-callback-foreign')
+        .send({ definitionKey: 'foreign.test.v1', ownerService: 'another-service', correlationId: 'corr-callback-foreign' })
+        .expect(201);
+      await mutate(request(srv).post(`/v1/workflow-runs/${foreignRun.body.data.id}/transitions`), admin)
+        .send({ to: 'RUNNING' }).expect(201);
+      await mutate(request(srv).post(`/v1/workflow-runs/${foreignRun.body.data.id}/steps`), admin)
+        .set('Idempotency-Key', 'step-callback-foreign')
+        .send({ stepKey: 'reserve', timeoutSeconds: 300 }).expect(201);
+      const denied = await request(srv)
+        .post(`/v1/workflow-runs/${foreignRun.body.data.id}/steps/reserve/callbacks`)
+        .set('Authorization', `Bearer ${bearer}`)
+        .set('Idempotency-Key', 'callback-owner-deny')
+        .send(callbackBody)
+        .expect(403);
+      expect(denied.body.error.code).toBe('FORBIDDEN');
+
+      await expect(dataSource.query(
+        'UPDATE workflow_step_callbacks SET "evidenceId" = $1 WHERE id = $2', ['tampered', first.body.data.callbackId],
+      )).rejects.toThrow(/append-only/);
+      const [{ n }] = (await dataSource.query(
+        'SELECT count(*)::int AS n FROM workflow_step_callbacks WHERE id = $1', [first.body.data.callbackId],
+      )) as { n: number }[];
+      expect(n).toBe(1);
     });
 
     it('keeps the audit log append-only at the database level', async () => {

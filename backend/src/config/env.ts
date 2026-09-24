@@ -1,4 +1,4 @@
-import { loadPanelTokenKeys, PanelTokenKeys } from '../common/crypto';
+import { loadPanelTokenKeys, loadWorkloadTokenVerifier, PanelTokenKeys, WorkloadTokenVerifier } from '../common/crypto';
 
 export const CORE_ENV = Symbol('CORE_ENV');
 
@@ -21,6 +21,7 @@ export interface CoreEnv {
   gatewayAllowedHosts: string[];
   gatewayMaxRequestBytes: number;
   gatewayMaxResponseBytes: number;
+  workloadTokenVerifier: WorkloadTokenVerifier | null;
 }
 
 function parseBoolean(source: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
@@ -95,6 +96,23 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): CoreEnv {
   if (production && gatewayAllowedHosts.length === 0) {
     throw new Error('GATEWAY_ALLOWED_HOSTS is required in production');
   }
+  const workloadJwks = source.WORKLOAD_JWKS_JSON?.trim() || null;
+  const workloadIssuer = source.WORKLOAD_TOKEN_ISSUER?.trim() || null;
+  const workloadAudience = source.WORKLOAD_TOKEN_AUDIENCE?.trim() || null;
+  const workloadSettings = [workloadJwks, workloadIssuer, workloadAudience];
+  if (workloadSettings.some(Boolean) && !workloadSettings.every(Boolean)) {
+    throw new Error('WORKLOAD_JWKS_JSON, WORKLOAD_TOKEN_ISSUER and WORKLOAD_TOKEN_AUDIENCE must be configured together');
+  }
+  if (production && (!workloadJwks || !workloadIssuer || !workloadAudience)) {
+    throw new Error('WORKLOAD_JWKS_JSON, WORKLOAD_TOKEN_ISSUER and WORKLOAD_TOKEN_AUDIENCE are required in production');
+  }
+  const workloadMaxTtl = parsePositiveInt(source, 'WORKLOAD_TOKEN_MAX_TTL_SECONDS', 300);
+  if (workloadMaxTtl < 30 || workloadMaxTtl > 900) {
+    throw new Error('WORKLOAD_TOKEN_MAX_TTL_SECONDS must be between 30 and 900');
+  }
+  const workloadTokenVerifier = workloadJwks && workloadIssuer && workloadAudience
+    ? loadWorkloadTokenVerifier(workloadJwks, workloadIssuer, workloadAudience, workloadMaxTtl)
+    : null;
   return {
     nodeEnv,
     port: parsePositiveInt(source, 'PORT', 3000),
@@ -114,6 +132,7 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): CoreEnv {
     gatewayAllowedHosts,
     gatewayMaxRequestBytes: parsePositiveInt(source, 'GATEWAY_MAX_REQUEST_BYTES', 262_144),
     gatewayMaxResponseBytes: parsePositiveInt(source, 'GATEWAY_MAX_RESPONSE_BYTES', 1_048_576),
+    workloadTokenVerifier,
   };
 }
 
