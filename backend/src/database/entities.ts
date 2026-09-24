@@ -171,6 +171,46 @@ export class ServiceObservationEntity {
   observedAt!: Date;
 }
 
+@Entity({ name: 'service_operational_profiles' })
+@Index(['ownerService', 'version'], { unique: true })
+export class ServiceOperationalProfileEntity {
+  @PrimaryColumn('uuid')
+  id!: string;
+
+  @Column({ type: 'varchar' })
+  ownerService!: string;
+
+  @Column({ type: 'int' })
+  version!: number;
+
+  @Column({ type: 'varchar' })
+  ownerTeam!: string;
+
+  @Column({ type: 'varchar' })
+  onCallRoute!: string;
+
+  @Column({ type: 'varchar' })
+  runbookUrl!: string;
+
+  @Column({ type: 'int' })
+  availabilityTargetBps!: number;
+
+  @Column({ type: 'int' })
+  latencyP95TargetMs!: number;
+
+  @Column({ type: 'int' })
+  rtoMinutes!: number;
+
+  @Column({ type: 'int' })
+  rpoMinutes!: number;
+
+  @Column('uuid')
+  recordedByPrincipalId!: string;
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  recordedAt!: Date;
+}
+
 export interface WorkflowDefinitionStep { stepKey: string; timeoutSeconds: number }
 
 @Entity({ name: 'workflow_definitions' })

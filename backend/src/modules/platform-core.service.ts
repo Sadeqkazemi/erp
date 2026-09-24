@@ -29,6 +29,7 @@ import {
   PrincipalEntity,
   RouteContractEntity,
   ServiceObservationEntity,
+  ServiceOperationalProfileEntity,
   SessionEntity,
   WorkflowRunEntity,
   WorkflowDefinitionEntity,
@@ -79,6 +80,17 @@ export interface AuditFilters {
   correlationId?: string;
   from?: string;
   to?: string;
+}
+
+export interface ServiceOperationalProfileInput {
+  expectedCurrentVersion: number;
+  ownerTeam: string;
+  onCallRoute: string;
+  runbookUrl: string;
+  availabilityTargetBps: number;
+  latencyP95TargetMs: number;
+  rtoMinutes: number;
+  rpoMinutes: number;
 }
 
 @Injectable()
@@ -1057,27 +1069,100 @@ export class PlatformCoreService {
           SELECT status, "latencyMs", "observedAt" FROM service_observations
           WHERE "routeId" = sr."routeId" ORDER BY "observedAt" DESC LIMIT 1
         ) o ON true
-      ) SELECT sp."ownerService", sp."activePanels", count(rl."routeId")::int AS "registeredRoutes",
+      ), service_health AS (
+        SELECT sp."ownerService", sp."activePanels", count(rl."routeId")::int AS "registeredRoutes",
         CASE WHEN count(rl."routeId") = 0 OR count(rl."observedAt") = 0 THEN 'UNKNOWN'
           WHEN count(*) FILTER (WHERE rl."observedAt" IS NULL OR rl."observedAt" < now() - interval '5 minutes') > 0 THEN 'STALE'
           WHEN bool_and(rl.status = 'UP') THEN 'UP' WHEN bool_and(rl.status = 'DOWN') THEN 'DOWN' ELSE 'DEGRADED' END AS health,
         max(rl."observedAt") AS "lastObservedAt",
         round(avg(rl."latencyMs") FILTER (WHERE rl."observedAt" >= now() - interval '5 minutes'))::int AS "averageLatencyMs"
       FROM service_panels sp LEFT JOIN route_latest rl ON rl."ownerService" = sp."ownerService"
-      GROUP BY sp."ownerService", sp."activePanels" ORDER BY sp."ownerService" LIMIT $2`, [cursor ?? null, limit + 1]) as Array<{
+      GROUP BY sp."ownerService", sp."activePanels"
+      ), profile_latest AS (
+        SELECT DISTINCT ON ("ownerService") "ownerService", version, "ownerTeam", "onCallRoute", "runbookUrl",
+          "availabilityTargetBps", "latencyP95TargetMs", "rtoMinutes", "rpoMinutes", "recordedAt"
+        FROM service_operational_profiles ORDER BY "ownerService", version DESC
+      ) SELECT sh.*, op.version AS "profileVersion", op."ownerTeam", op."onCallRoute", op."runbookUrl",
+        op."availabilityTargetBps", op."latencyP95TargetMs", op."rtoMinutes", op."rpoMinutes", op."recordedAt" AS "profileRecordedAt"
+      FROM service_health sh LEFT JOIN profile_latest op ON op."ownerService" = sh."ownerService"
+      ORDER BY sh."ownerService" LIMIT $2`, [cursor ?? null, limit + 1]) as Array<{
       ownerService: string; activePanels: number; registeredRoutes: number;
       health: 'UNKNOWN' | 'UP' | 'DOWN' | 'DEGRADED' | 'STALE';
       lastObservedAt: Date | null; averageLatencyMs: number | null;
+      profileVersion: number | null; ownerTeam: string | null; onCallRoute: string | null; runbookUrl: string | null;
+      availabilityTargetBps: number | null; latencyP95TargetMs: number | null;
+      rtoMinutes: number | null; rpoMinutes: number | null; profileRecordedAt: Date | null;
     }>;
     const page = rows.slice(0, limit);
     return {
       asOf: new Date().toISOString(),
-      services: page.map((row) => ({
-        ...row, lastObservedAt: row.lastObservedAt?.toISOString() ?? null,
-        observationSource: row.lastObservedAt ? 'MANUAL_PROBE' as const : null,
-      })),
+      services: page.map((row) => {
+        const { profileVersion, ownerTeam, onCallRoute, runbookUrl, availabilityTargetBps,
+          latencyP95TargetMs, rtoMinutes, rpoMinutes, profileRecordedAt, ...service } = row;
+        return {
+          ...service, lastObservedAt: service.lastObservedAt?.toISOString() ?? null,
+          observationSource: service.lastObservedAt ? 'MANUAL_PROBE' as const : null,
+          operationalReadiness: profileVersion ? 'CONFIGURED' as const : 'UNCONFIGURED' as const,
+          operationalProfile: profileVersion ? {
+            version: profileVersion, ownerTeam, onCallRoute, runbookUrl, availabilityTargetBps,
+            latencyP95TargetMs, rtoMinutes, rpoMinutes,
+            recordedAt: profileRecordedAt?.toISOString() ?? null,
+          } : null,
+        };
+      }),
       nextCursor: rows.length > limit ? page.at(-1)?.ownerService ?? null : null,
     };
+  }
+
+  async publishServiceOperationalProfile(
+    actor: AuthenticatedPrincipal, ownerService: string, input: ServiceOperationalProfileInput,
+    idempotencyKey: string, correlationId: string,
+  ) {
+    this.requirePlatformAdmin(actor);
+    if (!/^[a-z][a-z0-9-]{1,62}$/.test(ownerService)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'شناسه مالک سرویس نامعتبر است.' });
+    }
+    const normalized = this.validateOperationalProfile(input);
+    return this.dataSource.transaction(async (manager) =>
+      this.idempotent(manager, actor.id, `service.operational-profile.${ownerService}`, idempotencyKey, normalized, async () => {
+        await manager.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`service.operational-profile|${ownerService}`]);
+        const panel = await manager.findOne(PanelEntity, { where: { ownerService, status: 'ACTIVE' } });
+        if (!panel) {
+          throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'سرویس فعال در رجیستری پنل یافت نشد.' });
+        }
+        const current = await manager.findOne(ServiceOperationalProfileEntity, {
+          where: { ownerService }, order: { version: 'DESC' },
+        });
+        const currentVersion = current?.version ?? 0;
+        if (currentVersion !== normalized.expectedCurrentVersion) {
+          throw new ConflictException({
+            code: ErrorCode.CONFLICT,
+            message: 'نسخه پروفایل عملیاتی تغییر کرده است؛ آخرین نسخه را دوباره بخوانید.',
+          });
+        }
+        const saved = await manager.save(ServiceOperationalProfileEntity, {
+          id: randomUUID(), ownerService, version: currentVersion + 1,
+          ownerTeam: normalized.ownerTeam, onCallRoute: normalized.onCallRoute, runbookUrl: normalized.runbookUrl,
+          availabilityTargetBps: normalized.availabilityTargetBps,
+          latencyP95TargetMs: normalized.latencyP95TargetMs,
+          rtoMinutes: normalized.rtoMinutes, rpoMinutes: normalized.rpoMinutes,
+          recordedByPrincipalId: actor.id,
+        });
+        await this.appendControl(manager, {
+          actorId: actor.id, action: 'service.operational_profile.published',
+          objectType: 'service_operational_profile', objectId: saved.id, correlationId,
+          eventName: 'core.service.operational-profile.published.v1',
+          payload: { profileId: saved.id, ownerService, version: String(saved.version) },
+        });
+        return {
+          id: saved.id, ownerService: saved.ownerService, version: saved.version,
+          ownerTeam: saved.ownerTeam, onCallRoute: saved.onCallRoute, runbookUrl: saved.runbookUrl,
+          availabilityTargetBps: saved.availabilityTargetBps, latencyP95TargetMs: saved.latencyP95TargetMs,
+          rtoMinutes: saved.rtoMinutes, rpoMinutes: saved.rpoMinutes,
+          recordedAt: saved.recordedAt.toISOString(),
+        };
+      }),
+    );
   }
 
   private recordServiceObservation(
@@ -1277,6 +1362,31 @@ export class PlatformCoreService {
       allowedRealms: realms.join(','),
       version: input.version,
     };
+  }
+
+  private validateOperationalProfile(input: ServiceOperationalProfileInput): ServiceOperationalProfileInput {
+    const invalid = (message: string) => new BadRequestException({ code: ErrorCode.VALIDATION, message });
+    const ownerTeam = input.ownerTeam.trim();
+    const onCallRoute = input.onCallRoute.trim();
+    if (!ownerTeam || ownerTeam.length > 120 || !onCallRoute || onCallRoute.length > 160) {
+      throw invalid('مالک پاسخ‌گو یا مسیر آنکال نامعتبر است.');
+    }
+    let runbook: URL;
+    try {
+      runbook = new URL(input.runbookUrl);
+    } catch {
+      throw invalid('نشانی Runbook نامعتبر است.');
+    }
+    if (runbook.protocol !== 'https:' || runbook.username || runbook.password || runbook.hash) {
+      throw invalid('نشانی Runbook باید HTTPS و بدون اعتبارنامه یا fragment باشد.');
+    }
+    const inRange = (value: number, min: number, max: number) => Number.isInteger(value) && value >= min && value <= max;
+    if (!inRange(input.expectedCurrentVersion, 0, 2147483647) ||
+      !inRange(input.availabilityTargetBps, 1, 10000) || !inRange(input.latencyP95TargetMs, 1, 300000) ||
+      !inRange(input.rtoMinutes, 1, 525600) || !inRange(input.rpoMinutes, 0, 525600)) {
+      throw invalid('اهداف دسترس‌پذیری، تأخیر یا بازیابی نامعتبر است.');
+    }
+    return { ...input, ownerTeam, onCallRoute, runbookUrl: runbook.toString() };
   }
 
   private async openSession(principalId: string) {

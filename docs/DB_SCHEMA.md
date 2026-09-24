@@ -9,6 +9,7 @@ Tables:
 - `panels` — code (checked slug), owner service, classification, Persian and English titles, token audience, constrained status
 - `entitlements` — staff principal, panel, granting admin. Unique per principal and panel
 - `route_contracts` — method (constrained), path, upstream base URL, audience, timeout (50–5000 ms), allowed realms, version. Unique per method, path and version
+- `service_operational_profiles` — append-only, versioned service owner/on-call/runbook and service-specific availability, p95 latency, RTO and RPO targets. Unique per owner service and version; publication records the platform admin
 - `workflow_runs` — definition key, owning service, correlation id, engine status (constrained), starter, version, idempotency key unique per starter. No business payload
 - `audit_events` — actor, action, object, correlation id. A trigger rejects UPDATE, DELETE and TRUNCATE
 - `outbox_events` — event id, name, aggregate id, payload, `publishedAt`, attempts, last error. Dispatch claims rows with `FOR UPDATE SKIP LOCKED`
@@ -30,3 +31,7 @@ No booking, inventory, ticket, payment, crew, or maintenance tables.
 # Service observations (migration 0007)
 
 `service_observations` is append-only operational evidence for a registered gateway route. A manual admin probe records route ID, `UP`/`DOWN`, HTTP status when available, bounded latency, failure category, `MANUAL_PROBE` source and UTC observation time. It stores no response body or business record. The service catalog treats observations older than five minutes, or an incomplete route set, as stale rather than live health. The database rejects update, delete and truncate; retention/partitioning must be approved before production volume grows.
+
+# Service operational profiles (migration 0008)
+
+`service_operational_profiles` records each explicit operational contract as a new immutable version. Publication uses an advisory lock plus `expectedCurrentVersion`, so concurrent administrators cannot silently overwrite each other. Availability uses integer basis points, latency uses milliseconds, and RTO/RPO use minutes. The profile contains routing aliases and an HTTPS runbook URL, not credentials. Existing services remain honestly `UNCONFIGURED` until their accountable owner approves and publishes values; the migration does not fabricate targets.

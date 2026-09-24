@@ -211,6 +211,56 @@ class ServiceQueryDto {
   cursor?: string;
 }
 
+class PublishServiceOperationalProfileDto {
+  @ApiProperty({ example: 0, description: 'Latest observed profile version; zero when creating the first version' })
+  @IsInt()
+  @Min(0)
+  @Max(2147483647)
+  expectedCurrentVersion!: number;
+
+  @ApiProperty({ example: 'Platform Operations' })
+  @IsString()
+  @MinLength(1)
+  @MaxLength(120)
+  ownerTeam!: string;
+
+  @ApiProperty({ example: 'platform-primary' })
+  @IsString()
+  @MinLength(1)
+  @MaxLength(160)
+  onCallRoute!: string;
+
+  @ApiProperty({ example: 'https://runbooks.internal/platform-core' })
+  @IsString()
+  @MinLength(1)
+  @MaxLength(2048)
+  runbookUrl!: string;
+
+  @ApiProperty({ example: 9990, description: 'Availability target in basis points; 9990 means 99.90%' })
+  @IsInt()
+  @Min(1)
+  @Max(10000)
+  availabilityTargetBps!: number;
+
+  @ApiProperty({ example: 500 })
+  @IsInt()
+  @Min(1)
+  @Max(300000)
+  latencyP95TargetMs!: number;
+
+  @ApiProperty({ example: 60 })
+  @IsInt()
+  @Min(1)
+  @Max(525600)
+  rtoMinutes!: number;
+
+  @ApiProperty({ example: 15 })
+  @IsInt()
+  @Min(0)
+  @Max(525600)
+  rpoMinutes!: number;
+}
+
 class RegisterRouteDto {
   @ApiProperty({ example: 'GET' })
   @IsString()
@@ -528,6 +578,21 @@ export class PlatformCoreController {
     const actor = await this.actor(req);
     const result = await this.core.listRegisteredServices(actor, query.limit, query.cursor);
     return { success: true, data: { asOf: result.asOf, services: result.services }, page: { nextCursor: result.nextCursor } };
+  }
+
+  @Post('v1/control-plane/services/:ownerService/operational-profiles')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({ summary: 'انتشار نسخه جدید پروفایل مالکیت، SLO و بازیابی سرویس' })
+  async publishServiceOperationalProfile(
+    @Req() req: AuthedRequest, @Param('ownerService') ownerService: string,
+    @Body() dto: PublishServiceOperationalProfileDto,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    const actor = await this.requireMutation(req);
+    const result = await this.core.publishServiceOperationalProfile(
+      actor, ownerService, dto, this.idempotencyKey(idempotencyKey), this.correlation(req),
+    );
+    return { success: true, data: result };
   }
 
   @Get('v1/outbox/dead-letters')

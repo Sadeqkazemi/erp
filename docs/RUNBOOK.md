@@ -4,6 +4,7 @@
 - Migrations: `DATABASE_MIGRATION_URL=<migration role> npm run migration:run`. The service never runs migrations and refuses to start while any are pending.
 - Health: `GET /health` returns `status: ok` only when the core database answers `SELECT 1`.
 - Control plane diagnostics: platform admins may read `GET /v1/control-plane/summary`. The `outbox.oldestAgeSeconds` and `outbox.retried` fields help detect delivery lag; `domainSales=UNCONFIGURED` means no sales data source is connected. Do not infer sales or service availability from core counts.
+- Operational ownership: publish a new version with `POST /v1/control-plane/services/:ownerService/operational-profiles` only after the owning team approves its on-call alias, HTTPS runbook, availability/p95 latency target and measured RTO/RPO. Use the latest catalog version as `expectedCurrentVersion`; a `409` means another administrator published first. Never put paging credentials or secret tokens in the profile. `CONFIGURED` proves the contract was recorded, not that the target is currently met.
 - Logs are structured JSON. Session cookies and authorization headers are redacted. Unsafe `X-Request-Id` values are replaced.
 - Panel token signing key: `PANEL_TOKEN_PRIVATE_KEY` (Ed25519). Services verify tokens with `GET /.well-known/jwks.json`. Rotating the key invalidates outstanding panel tokens (they live at most `PANEL_TOKEN_TTL_SECONDS`).
 - Rollback of this service is redeploy of the previous image. Do not restore this database over a newer domain database; the core database holds no orders or tickets.
