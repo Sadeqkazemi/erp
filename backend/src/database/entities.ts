@@ -143,6 +143,26 @@ export class RouteContractEntity {
   createdAt!: Date;
 }
 
+export interface WorkflowDefinitionStep { stepKey: string; timeoutSeconds: number }
+
+@Entity({ name: 'workflow_definitions' })
+export class WorkflowDefinitionEntity {
+  @PrimaryColumn('uuid')
+  id!: string;
+
+  @Column({ type: 'varchar', unique: true })
+  definitionKey!: string;
+
+  @Column({ type: 'varchar' })
+  ownerService!: string;
+
+  @Column({ type: 'jsonb' })
+  steps!: WorkflowDefinitionStep[];
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  createdAt!: Date;
+}
+
 @Entity({ name: 'workflow_runs' })
 @Index(['startedByPrincipalId', 'idempotencyKey'], { unique: true })
 export class WorkflowRunEntity {

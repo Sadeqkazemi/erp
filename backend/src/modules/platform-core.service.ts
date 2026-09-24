@@ -30,6 +30,8 @@ import {
   RouteContractEntity,
   SessionEntity,
   WorkflowRunEntity,
+  WorkflowDefinitionEntity,
+  WorkflowDefinitionStep,
   WorkflowStepEntity,
   VisitorConsentEntity,
 } from '../database/entities';
@@ -586,6 +588,13 @@ export class PlatformCoreService {
     this.requireStaff(actor);
     return this.dataSource.transaction(async (manager) =>
       this.idempotent(manager, actor.id, 'workflow.start', idempotencyKey, input, async () => {
+        const definition = await manager.findOne(WorkflowDefinitionEntity, { where: { definitionKey: input.definitionKey } });
+        if (!definition && this.env.workflowDefinitionsRequired) {
+          throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'تعریف گردش‌کار ثبت نشده است.' });
+        }
+        if (definition && definition.ownerService !== input.ownerService) {
+          throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'مالک گردش‌کار با تعریف ثبت‌شده مطابقت ندارد.' });
+        }
         const run = manager.create(WorkflowRunEntity, {
           id: randomUUID(),
           definitionKey: input.definitionKey,
@@ -610,6 +619,32 @@ export class PlatformCoreService {
         return { id: run.id, status: run.status, ownerService: run.ownerService };
       }),
     );
+  }
+
+  async registerWorkflowDefinition(
+    actor: AuthenticatedPrincipal,
+    input: { definitionKey: string; ownerService: string; steps: WorkflowDefinitionStep[] },
+    correlationId: string,
+  ): Promise<WorkflowDefinitionEntity> {
+    this.requirePlatformAdmin(actor);
+    const keys = input.steps.map((step) => step.stepKey);
+    if (new Set(keys).size !== keys.length) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'کلید گام تکراری است.' });
+    }
+    return this.dataSource.transaction(async (manager) => {
+      await manager.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`workflow.definition|${input.definitionKey}`]);
+      const existing = await manager.findOne(WorkflowDefinitionEntity, { where: { definitionKey: input.definitionKey } });
+      if (existing) throw new ConflictException({ code: ErrorCode.CONFLICT, message: 'نسخهٔ تعریف از قبل ثبت شده است.' });
+      const definition = await manager.save(manager.create(WorkflowDefinitionEntity, {
+        id: randomUUID(), definitionKey: input.definitionKey, ownerService: input.ownerService, steps: input.steps,
+      }));
+      await this.appendControl(manager, {
+        actorId: actor.id, action: 'workflow.definition.registered', objectType: 'workflow_definition',
+        objectId: definition.id, correlationId, eventName: 'core.workflow.definition.registered.v1',
+        payload: { definitionId: definition.id, definitionKey: definition.definitionKey, ownerService: definition.ownerService },
+      });
+      return definition;
+    });
   }
 
   async transitionWorkflow(actor: AuthenticatedPrincipal, id: string, to: WorkflowStatus, correlationId: string): Promise<WorkflowRunEntity> {
@@ -672,6 +707,13 @@ export class PlatformCoreService {
       this.assertWorkflowActor(actor, run);
       if (run.status !== 'RUNNING' && run.status !== 'WAITING') {
         throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'اجرای گردش‌کار آماده ثبت گام نیست.' });
+      }
+      const definition = await manager.findOne(WorkflowDefinitionEntity, { where: { definitionKey: run.definitionKey } });
+      if (!definition && this.env.workflowDefinitionsRequired) {
+        throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'تعریف گردش‌کار ثبت نشده است.' });
+      }
+      if (definition && !definition.steps.some((step) => step.stepKey === input.stepKey && step.timeoutSeconds === input.timeoutSeconds)) {
+        throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'گام یا مهلت آن در تعریف ثبت‌شده نیست.' });
       }
       return this.idempotent(manager, actor.id, `workflow.step.${workflowRunId}`, idempotencyKey, input, async () => {
         const existing = await manager.findOne(WorkflowStepEntity, { where: { workflowRunId, stepKey: input.stepKey } });

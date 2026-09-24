@@ -2,7 +2,7 @@ import { BadRequestException, Body, Controller, Get, Headers, Param, ParseUUIDPi
 import { Type } from 'class-transformer';
 import { ApiOperation, ApiProperty, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
-import { IsIn, IsInt, IsISO8601, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { ArrayMaxSize, ArrayMinSize, IsArray, IsIn, IsInt, IsISO8601, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, MinLength, ValidateNested } from 'class-validator';
 import { Request, Response } from 'express';
 import { ErrorCode } from '../common/errors';
 import { csrfCookieName, randomToken } from '../common/crypto';
@@ -103,6 +103,31 @@ class StartWorkflowDto {
   @ApiProperty({ example: 'corr-1' })
   @Matches(/^[A-Za-z0-9._:-]{1,128}$/)
   correlationId!: string;
+}
+
+class WorkflowDefinitionStepDto {
+  @Matches(/^[a-z][a-z0-9-]{1,62}$/)
+  stepKey!: string;
+
+  @IsInt()
+  @Min(1)
+  @Max(604800)
+  timeoutSeconds!: number;
+}
+
+class RegisterWorkflowDefinitionDto {
+  @Matches(/^[a-z][a-z0-9.-]{1,120}$/)
+  definitionKey!: string;
+
+  @Matches(/^[a-z][a-z0-9-]{1,62}$/)
+  ownerService!: string;
+
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(32)
+  @ValidateNested({ each: true })
+  @Type(() => WorkflowDefinitionStepDto)
+  steps!: WorkflowDefinitionStepDto[];
 }
 
 class TransitionWorkflowDto {
@@ -350,6 +375,14 @@ export class PlatformCoreController {
     const actor = await this.requireMutation(req);
     const run = await this.core.startWorkflow(actor, dto, this.idempotencyKey(idempotencyKey));
     return { success: true, data: { id: run.id, status: run.status, ownerService: run.ownerService } };
+  }
+
+  @Post('v1/workflow-definitions')
+  @ApiOperation({ summary: 'ثبت تعریف نسخه‌دار و تغییرناپذیر گردش‌کار توسط مدیر هسته' })
+  async registerWorkflowDefinition(@Req() req: AuthedRequest, @Body() dto: RegisterWorkflowDefinitionDto) {
+    const actor = await this.requireMutation(req);
+    const definition = await this.core.registerWorkflowDefinition(actor, dto, this.correlation(req));
+    return { success: true, data: { id: definition.id, definitionKey: definition.definitionKey, ownerService: definition.ownerService } };
   }
 
   @Post('v1/workflow-runs/:id/transitions')

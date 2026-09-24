@@ -29,6 +29,7 @@ The core is a control plane. These routes do not create bookings, tickets, inven
 | POST | `/v1/visitor-consents` | Origin, rate limit; anonymous | Record optional cookie grant or withdrawal, set opaque HttpOnly visitor cookie |
 | GET | `/v1/visitor-consents/me` | anonymous visitor cookie | Latest optional cookie decisions; both denied when absent |
 | GET | `/v1/audit-events` | platform admin | Append-only control-plane audit (enforced by a database trigger), with optional `limit` (1–100), `cursor`, `action`, `correlationId`, `from`, `to` query parameters. Existing `data` array includes `createdAt` and `actorPrincipalId`; `page.nextCursor` is null at the end |
+| POST | `/v1/workflow-definitions` | platform admin + CSRF + Origin | Register one immutable versioned `definitionKey`, owner service and 1–32 unique step keys with 1–604800-second deadlines. A changed contract needs a new key/version; 409 on duplicate |
 | GET | `/v1/control-plane/summary` | platform admin | Actual counts of panels, route contracts, workflow statuses, pending/retried outbox events, oldest pending age and seven UTC days of audit counts. `domainSales.status=UNCONFIGURED` until the owning service is integrated |
 | GET | `/v1/outbox/dead-letters` | platform admin | Last 100 halted outbox events and failure details, with no event payload |
 | POST | `/v1/outbox/dead-letters/:id/requeue` | platform admin + CSRF + Origin | Audited replay after investigating a failed event; preserves its event ID |

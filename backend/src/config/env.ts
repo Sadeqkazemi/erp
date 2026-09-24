@@ -17,6 +17,7 @@ export interface CoreEnv {
   exposeApiDocs: boolean;
   outboxPublishUrl: string | null;
   outboxPublishToken: string | null;
+  workflowDefinitionsRequired: boolean;
 }
 
 function parseBoolean(source: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
@@ -96,6 +97,7 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): CoreEnv {
     exposeApiDocs,
     outboxPublishUrl,
     outboxPublishToken,
+    workflowDefinitionsRequired: production,
   };
 }
 

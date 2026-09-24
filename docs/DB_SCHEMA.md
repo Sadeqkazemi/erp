@@ -23,3 +23,6 @@ Agency principals carry `tenantId` (UUID); staff and customers remain outside ag
 - `idempotency_records` — principal, scope (operation), key, request hash, stored response. Unique per principal, scope and key
 
 No booking, inventory, ticket, payment, crew, or maintenance tables.
+# Workflow definition registry (migration 0006)
+
+`workflow_definitions` stores an immutable key such as `operations.recovery.v1`, the owner service and an ordered JSON array of 1–32 `{stepKey, timeoutSeconds}` entries. Runtime validates unique keys and bounds before insert; the database enforces key uniqueness and a nonempty array. Existing runs remain unchanged. Register approved definitions before switching on production traffic; do not backfill invented owners or steps from historical runs. The migration adds a table and can be rolled back only after verifying no definitions require retention.
