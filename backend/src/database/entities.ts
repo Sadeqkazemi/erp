@@ -143,6 +143,34 @@ export class RouteContractEntity {
   createdAt!: Date;
 }
 
+@Entity({ name: 'service_observations' })
+@Index(['routeId', 'observedAt'])
+export class ServiceObservationEntity {
+  @PrimaryColumn('uuid')
+  id!: string;
+
+  @Column('uuid')
+  routeId!: string;
+
+  @Column({ type: 'varchar' })
+  status!: 'UP' | 'DOWN';
+
+  @Column({ type: 'int', nullable: true })
+  httpStatus!: number | null;
+
+  @Column({ type: 'int' })
+  latencyMs!: number;
+
+  @Column({ type: 'varchar', nullable: true })
+  errorCode!: string | null;
+
+  @Column({ type: 'varchar' })
+  source!: 'MANUAL_PROBE';
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  observedAt!: Date;
+}
+
 export interface WorkflowDefinitionStep { stepKey: string; timeoutSeconds: number }
 
 @Entity({ name: 'workflow_definitions' })

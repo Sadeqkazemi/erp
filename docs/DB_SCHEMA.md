@@ -26,3 +26,7 @@ No booking, inventory, ticket, payment, crew, or maintenance tables.
 # Workflow definition registry (migration 0006)
 
 `workflow_definitions` stores an immutable key such as `operations.recovery.v1`, the owner service and an ordered JSON array of 1–32 `{stepKey, timeoutSeconds}` entries. Runtime validates unique keys and bounds before insert; the database enforces key uniqueness and a nonempty array. Existing runs remain unchanged. Register approved definitions before switching on production traffic; do not backfill invented owners or steps from historical runs. The migration adds a table and can be rolled back only after verifying no definitions require retention.
+
+# Service observations (migration 0007)
+
+`service_observations` is append-only operational evidence for a registered gateway route. A manual admin probe records route ID, `UP`/`DOWN`, HTTP status when available, bounded latency, failure category, `MANUAL_PROBE` source and UTC observation time. It stores no response body or business record. The service catalog treats observations older than five minutes, or an incomplete route set, as stale rather than live health. The database rejects update, delete and truncate; retention/partitioning must be approved before production volume grows.

@@ -8,6 +8,7 @@ import {
   PanelEntity,
   PrincipalEntity,
   RouteContractEntity,
+  ServiceObservationEntity,
   SessionEntity,
   WorkflowRunEntity,
   WorkflowDefinitionEntity,
@@ -21,6 +22,7 @@ import { AgencyTenant1710000000003 } from './migrations/1710000000003-AgencyTena
 import { WorkflowSteps1710000000004 } from './migrations/1710000000004-WorkflowSteps';
 import { OutboxRecovery1710000000005 } from './migrations/1710000000005-OutboxRecovery';
 import { WorkflowDefinitions1710000000006 } from './migrations/1710000000006-WorkflowDefinitions';
+import { ServiceObservations1710000000007 } from './migrations/1710000000007-ServiceObservations';
 
 export const coreEntities = [
   PrincipalEntity,
@@ -28,6 +30,7 @@ export const coreEntities = [
   PanelEntity,
   EntitlementEntity,
   RouteContractEntity,
+  ServiceObservationEntity,
   WorkflowRunEntity,
   WorkflowDefinitionEntity,
   WorkflowStepEntity,
@@ -46,7 +49,7 @@ export function createDataSource(databaseUrl = process.env.DATABASE_URL): DataSo
     type: 'postgres',
     url: databaseUrl,
     entities: coreEntities,
-    migrations: [PlatformCoreFoundation1710000000000, PlatformCoreHardening1710000000001, VisitorConsent1710000000002, AgencyTenant1710000000003, WorkflowSteps1710000000004, OutboxRecovery1710000000005, WorkflowDefinitions1710000000006],
+    migrations: [PlatformCoreFoundation1710000000000, PlatformCoreHardening1710000000001, VisitorConsent1710000000002, AgencyTenant1710000000003, WorkflowSteps1710000000004, OutboxRecovery1710000000005, WorkflowDefinitions1710000000006, ServiceObservations1710000000007],
     synchronize: false,
   });
 }

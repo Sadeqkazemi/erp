@@ -28,6 +28,7 @@ import {
   PanelEntity,
   PrincipalEntity,
   RouteContractEntity,
+  ServiceObservationEntity,
   SessionEntity,
   WorkflowRunEntity,
   WorkflowDefinitionEntity,
@@ -558,7 +559,9 @@ export class PlatformCoreService {
     };
   }
 
-  async probeUpstream(actor: AuthenticatedPrincipal, routeId: string): Promise<{ isolated: true }> {
+  async probeUpstream(actor: AuthenticatedPrincipal, routeId: string): Promise<{
+    isolated: true; status: 'UP'; latencyMs: number; observedAt: string;
+  }> {
     this.requirePlatformAdmin(actor);
     const route = await this.dataSource.getRepository(RouteContractEntity).findOne({ where: { id: routeId } });
     if (!route) {
@@ -566,10 +569,12 @@ export class PlatformCoreService {
     }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), route.timeoutMs);
+    const startedAt = Date.now();
     let response: Response;
     try {
       response = await fetch(route.upstreamBaseUrl, { method: 'GET', redirect: 'manual', signal: controller.signal });
     } catch {
+      await this.recordServiceObservation(route.id, 'DOWN', Date.now() - startedAt, null, 'FETCH_FAILED');
       throw new ConflictException({
         code: ErrorCode.UPSTREAM_TIMEOUT,
         message: 'سرویس بالادست در مهلت مقرر پاسخ نداد. هسته در دسترس ماند.',
@@ -579,9 +584,11 @@ export class PlatformCoreService {
     }
     await response.body?.cancel();
     if (!response.ok) {
+      await this.recordServiceObservation(route.id, 'DOWN', Date.now() - startedAt, response.status, `HTTP_${response.status}`);
       throw new ConflictException({ code: ErrorCode.CONFLICT, message: 'سرویس بالادست پاسخ سالم نداد.' });
     }
-    return { isolated: true };
+    const observation = await this.recordServiceObservation(route.id, 'UP', Date.now() - startedAt, response.status, null);
+    return { isolated: true, status: 'UP', latencyMs: observation.latencyMs, observedAt: observation.observedAt.toISOString() };
   }
 
   async startWorkflow(
@@ -967,19 +974,49 @@ export class PlatformCoreService {
 
   async listRegisteredServices(actor: AuthenticatedPrincipal, limit = 100, cursor?: string) {
     this.requirePlatformAdmin(actor);
-    const rows = await this.dataSource.query(`SELECT p."ownerService" AS "ownerService",
-      count(DISTINCT p.id)::int AS "activePanels", count(DISTINCT r.id)::int AS "registeredRoutes"
-      FROM panels p LEFT JOIN route_contracts r ON r.audience = p.audience
-      WHERE p.status = 'ACTIVE' AND ($1::varchar IS NULL OR p."ownerService" > $1)
-      GROUP BY p."ownerService" ORDER BY p."ownerService" LIMIT $2`, [cursor ?? null, limit + 1]) as Array<{
+    const rows = await this.dataSource.query(`WITH service_panels AS (
+        SELECT p."ownerService", count(DISTINCT p.id)::int AS "activePanels"
+        FROM panels p WHERE p.status = 'ACTIVE' AND ($1::varchar IS NULL OR p."ownerService" > $1)
+        GROUP BY p."ownerService"
+      ), service_routes AS (
+        SELECT DISTINCT p."ownerService", r.id AS "routeId"
+        FROM panels p JOIN route_contracts r ON r.audience = p.audience WHERE p.status = 'ACTIVE'
+      ), route_latest AS (
+        SELECT sr."ownerService", sr."routeId", o.status, o."latencyMs", o."observedAt"
+        FROM service_routes sr LEFT JOIN LATERAL (
+          SELECT status, "latencyMs", "observedAt" FROM service_observations
+          WHERE "routeId" = sr."routeId" ORDER BY "observedAt" DESC LIMIT 1
+        ) o ON true
+      ) SELECT sp."ownerService", sp."activePanels", count(rl."routeId")::int AS "registeredRoutes",
+        CASE WHEN count(rl."routeId") = 0 OR count(rl."observedAt") = 0 THEN 'UNKNOWN'
+          WHEN count(*) FILTER (WHERE rl."observedAt" IS NULL OR rl."observedAt" < now() - interval '5 minutes') > 0 THEN 'STALE'
+          WHEN bool_and(rl.status = 'UP') THEN 'UP' WHEN bool_and(rl.status = 'DOWN') THEN 'DOWN' ELSE 'DEGRADED' END AS health,
+        max(rl."observedAt") AS "lastObservedAt",
+        round(avg(rl."latencyMs") FILTER (WHERE rl."observedAt" >= now() - interval '5 minutes'))::int AS "averageLatencyMs"
+      FROM service_panels sp LEFT JOIN route_latest rl ON rl."ownerService" = sp."ownerService"
+      GROUP BY sp."ownerService", sp."activePanels" ORDER BY sp."ownerService" LIMIT $2`, [cursor ?? null, limit + 1]) as Array<{
       ownerService: string; activePanels: number; registeredRoutes: number;
+      health: 'UNKNOWN' | 'UP' | 'DOWN' | 'DEGRADED' | 'STALE';
+      lastObservedAt: Date | null; averageLatencyMs: number | null;
     }>;
     const page = rows.slice(0, limit);
     return {
       asOf: new Date().toISOString(),
-      services: page.map((row) => ({ ...row, health: 'UNKNOWN' as const, lastObservedAt: null })),
+      services: page.map((row) => ({
+        ...row, lastObservedAt: row.lastObservedAt?.toISOString() ?? null,
+        observationSource: row.lastObservedAt ? 'MANUAL_PROBE' as const : null,
+      })),
       nextCursor: rows.length > limit ? page.at(-1)?.ownerService ?? null : null,
     };
+  }
+
+  private recordServiceObservation(
+    routeId: string, status: 'UP' | 'DOWN', latencyMs: number, httpStatus: number | null, errorCode: string | null,
+  ): Promise<ServiceObservationEntity> {
+    return this.dataSource.getRepository(ServiceObservationEntity).save({
+      id: randomUUID(), routeId, status, httpStatus,
+      latencyMs: Math.max(0, Math.min(300000, latencyMs)), errorCode, source: 'MANUAL_PROBE',
+    });
   }
 
   async listDeadLetters(actor: AuthenticatedPrincipal): Promise<Array<{
