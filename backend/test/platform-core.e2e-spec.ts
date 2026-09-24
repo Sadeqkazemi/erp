@@ -666,6 +666,8 @@ describe('platform core', () => {
       const [{ n: pending }] = (await dataSource.query('SELECT count(*)::int AS n FROM outbox_events WHERE "publishedAt" IS NULL')) as { n: number }[];
       expect(pending).toBeGreaterThan(0);
       brokerAvailable = true;
+      // Advance the durable retry schedule without a wall-clock sleep; immediate retries must remain blocked by backoff.
+      await dataSource.query('UPDATE outbox_events SET "nextAttemptAt" = now() WHERE "publishedAt" IS NULL');
       expect(await core.dispatchOutbox()).toBe(pending);
     });
   });
