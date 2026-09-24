@@ -80,7 +80,7 @@ export class PanelEntity {
   @Column({ type: 'varchar' })
   titleEn!: string;
 
-  @Column({ type: 'varchar' })
+  @Column({ type: 'varchar', unique: true })
   audience!: string;
 
   @Column({ type: 'varchar', default: 'ACTIVE' })
@@ -138,6 +138,9 @@ export class RouteContractEntity {
 
   @Column({ type: 'varchar' })
   version!: string;
+
+  @Column({ type: 'varchar', nullable: true })
+  tenantPathParam!: string | null;
 
   @CreateDateColumn({ type: 'timestamptz' })
   createdAt!: Date;

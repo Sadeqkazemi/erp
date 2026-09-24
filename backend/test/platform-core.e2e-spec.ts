@@ -33,6 +33,8 @@ describe('platform core', () => {
   let adminPassword = '';
   let staffId = '';
   let staffTotp = '';
+  let agencyAId = '';
+  let agencyBId = '';
   let broker: Server;
   const delivered = new Set<string>();
   const gatewayRequests: Array<Record<string, unknown>> = [];
@@ -182,6 +184,14 @@ describe('platform core', () => {
       password: 'Customer-pass-1',
       role: 'MEMBER',
     });
+    agencyAId = (await core.createPrincipal({
+      realm: 'AGENCY', tenantId: '11111111-1111-4111-8111-111111111111',
+      username: 'agency-agent', password: 'Agency-pass-1', role: 'MEMBER',
+    })).id;
+    agencyBId = (await core.createPrincipal({
+      realm: 'AGENCY', tenantId: '22222222-2222-4222-8222-222222222222',
+      username: 'agency-agent', password: 'Agency-pass-2', role: 'MEMBER',
+    })).id;
   }, 120000);
 
   afterAll(async () => {
@@ -193,14 +203,17 @@ describe('platform core', () => {
     }
   });
 
-  async function login(username: string, password: string, totp?: string) {
+  async function login(
+    username: string, password: string, totp?: string,
+    realm: 'STAFF' | 'CUSTOMER' | 'AGENCY' = totp ? 'STAFF' : 'CUSTOMER', tenantId?: string,
+  ) {
     // Each TOTP step is single-use; tests log in repeatedly within one step, so clear the marker first.
     if (totp) {
       await dataSource.query('UPDATE principals SET "lastTotpStep" = NULL WHERE username = $1', [username]);
     }
     const response = await request(app.getHttpServer())
       .post('/v1/sessions')
-      .send({ realm: totp ? 'STAFF' : 'CUSTOMER', username, password, totp: totp ? core.currentTotp(totp) : undefined })
+      .send({ realm, tenantId, username, password, totp: totp ? core.currentTotp(totp) : undefined })
       .expect(201);
     const cookie = response.headers['set-cookie'];
     const csrf = response.body.data.csrfToken as string;
@@ -728,6 +741,41 @@ describe('platform core', () => {
         'SELECT count(*)::int AS n FROM workflow_step_callbacks WHERE id = $1', [first.body.data.callbackId],
       )) as { n: number }[];
       expect(n).toBe(1);
+    });
+
+    it('binds agency gateway access to the signed tenant and denies cross-agency object paths', async () => {
+      const admin = await adminLogin();
+      const srv = app.getHttpServer();
+      await mutate(request(srv).post('/v1/panels'), admin)
+        .set('Idempotency-Key', 'panel-agency-0001')
+        .send({
+          code: 'agency-orders', ownerService: 'agency-service', classification: 'CONFIDENTIAL',
+          titleFa: 'سفارش‌های آژانس', titleEn: 'Agency orders', audience: 'agency:orders',
+        }).expect(201);
+      const wrongRealm = await mutate(request(srv).post('/v1/entitlements'), admin)
+        .send({ principalId: staffId, panelCode: 'agency-orders' }).expect(403);
+      expect(wrongRealm.body.error.code).toBe('REALM_REJECTED');
+      await mutate(request(srv).post('/v1/entitlements'), admin)
+        .send({ principalId: agencyAId, panelCode: 'agency-orders' }).expect(201);
+      await mutate(request(srv).post('/v1/entitlements'), admin)
+        .send({ principalId: agencyBId, panelCode: 'agency-orders' }).expect(201);
+      await mutate(request(srv).post('/v1/gateway/routes'), admin).send({
+        method: 'GET', pathPattern: '/v1/agencies/{tenantId}/orders/{id}',
+        upstreamBaseUrl: 'http://127.0.0.1:9', audience: 'agency:orders', timeoutMs: 50,
+        allowedRealms: 'AGENCY', version: 'v1', tenantPathParam: 'tenantId',
+      }).expect(201);
+
+      const agencyA = await login(
+        'agency-agent', 'Agency-pass-1', undefined, 'AGENCY', '11111111-1111-4111-8111-111111111111',
+      );
+      const issued = await mutate(request(srv).post('/v1/panels/agency-orders/access-tokens'), agencyA).expect(201);
+      const decide = (path?: string) => request(srv).post('/v1/gateway/decisions')
+        .set('Authorization', `Bearer ${issued.body.data.token}`)
+        .send({ method: 'GET', pathPattern: '/v1/agencies/{tenantId}/orders/{id}', version: 'v1', path });
+      await decide('/v1/agencies/11111111-1111-4111-8111-111111111111/orders/42').expect(201);
+      const foreign = await decide('/v1/agencies/22222222-2222-4222-8222-222222222222/orders/42').expect(403);
+      expect(foreign.body.error.code).toBe('FORBIDDEN');
+      await decide().expect(403);
     });
 
     it('keeps the audit log append-only at the database level', async () => {

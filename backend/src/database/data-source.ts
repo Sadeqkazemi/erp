@@ -27,6 +27,7 @@ import { WorkflowDefinitions1710000000006 } from './migrations/1710000000006-Wor
 import { ServiceObservations1710000000007 } from './migrations/1710000000007-ServiceObservations';
 import { ServiceOperationalProfiles1710000000008 } from './migrations/1710000000008-ServiceOperationalProfiles';
 import { WorkflowCallbacks1710000000009 } from './migrations/1710000000009-WorkflowCallbacks';
+import { RouteTenantPolicy1710000000010 } from './migrations/1710000000010-RouteTenantPolicy';
 
 export const coreEntities = [
   PrincipalEntity,
@@ -55,7 +56,7 @@ export function createDataSource(databaseUrl = process.env.DATABASE_URL): DataSo
     type: 'postgres',
     url: databaseUrl,
     entities: coreEntities,
-    migrations: [PlatformCoreFoundation1710000000000, PlatformCoreHardening1710000000001, VisitorConsent1710000000002, AgencyTenant1710000000003, WorkflowSteps1710000000004, OutboxRecovery1710000000005, WorkflowDefinitions1710000000006, ServiceObservations1710000000007, ServiceOperationalProfiles1710000000008, WorkflowCallbacks1710000000009],
+    migrations: [PlatformCoreFoundation1710000000000, PlatformCoreHardening1710000000001, VisitorConsent1710000000002, AgencyTenant1710000000003, WorkflowSteps1710000000004, OutboxRecovery1710000000005, WorkflowDefinitions1710000000006, ServiceObservations1710000000007, ServiceOperationalProfiles1710000000008, WorkflowCallbacks1710000000009, RouteTenantPolicy1710000000010],
     synchronize: false,
   });
 }

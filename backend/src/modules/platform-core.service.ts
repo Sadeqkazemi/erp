@@ -73,7 +73,7 @@ export interface AuthenticatedWorkload {
 
 const ARGON2_OPTIONS = { memoryCost: 19_456, timeCost: 2, parallelism: 1 } as const;
 const ROUTE_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
-const REALMS: PrincipalEntity['realm'][] = ['STAFF', 'CUSTOMER', 'AGENCY', 'WORKLOAD'];
+const GATEWAY_REALMS: PrincipalEntity['realm'][] = ['STAFF', 'AGENCY'];
 const OUTBOX_BATCH = 100;
 const FORWARDED_REQUEST_HEADERS = ['accept', 'content-type', 'idempotency-key', 'if-match', 'if-none-match'] as const;
 const FORWARDED_RESPONSE_HEADERS = ['cache-control', 'content-type', 'etag', 'last-modified', 'retry-after'] as const;
@@ -86,6 +86,7 @@ export interface RouteInput {
   timeoutMs: number;
   allowedRealms: string[];
   version: string;
+  tenantPathParam?: string;
 }
 
 export interface PublishedEvent {
@@ -539,16 +540,23 @@ export class PlatformCoreService {
       });
     }
     const target = await this.requirePrincipal(input.principalId);
-    if (target.realm !== 'STAFF') {
+    if (target.realm !== 'STAFF' && target.realm !== 'AGENCY') {
       throw new ForbiddenException({
         code: ErrorCode.REALM_REJECTED,
-        message: 'دسترسی پنل کارکنان به هویت مشتری یا آژانس داده نمی‌شود.',
+        message: 'دسترسی پنل به هویت مشتری یا سرویس داده نمی‌شود.',
       });
     }
     return this.dataSource.transaction(async (manager) => {
       const panel = await manager.findOne(PanelEntity, { where: { code: input.panelCode, status: 'ACTIVE' } });
       if (!panel) {
         throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'پنل یافت نشد.' });
+      }
+      const expectedAudiencePrefix = target.realm === 'AGENCY' ? 'agency:' : 'panel:';
+      if (!panel.audience.startsWith(expectedAudiencePrefix)) {
+        throw new ForbiddenException({
+          code: ErrorCode.REALM_REJECTED,
+          message: 'کانال پنل با قلمرو هویت مقصد سازگار نیست.',
+        });
       }
       const existing = await manager.findOne(EntitlementEntity, { where: { principalId: target.id, panelId: panel.id } });
       if (existing) {
@@ -605,7 +613,10 @@ export class PlatformCoreService {
     const entitlement = await this.dataSource.getRepository(EntitlementEntity).findOne({
       where: { principalId: actor.id, panelId: panel.id, status: 'ACTIVE' },
     });
-    if (!entitlement || actor.realm !== 'STAFF') {
+    const expectedAudiencePrefix = actor.realm === 'AGENCY' ? 'agency:' : 'panel:';
+    if (!entitlement || (actor.realm !== 'STAFF' && actor.realm !== 'AGENCY') ||
+      !panel.audience.startsWith(expectedAudiencePrefix) ||
+      (actor.realm === 'AGENCY' && !actor.tenantId)) {
       throw new ForbiddenException({
         code: ErrorCode.FORBIDDEN,
         message: 'به این پنل دسترسی ندارید.',
@@ -620,6 +631,7 @@ export class PlatformCoreService {
         aud: panel.audience,
         panelId: panel.id,
         realm: actor.realm,
+        ...(actor.tenantId ? { tenantId: actor.tenantId } : {}),
         sid: actor.sessionId,
         jti: randomUUID(),
         iat: now,
@@ -638,6 +650,10 @@ export class PlatformCoreService {
     this.requirePlatformAdmin(actor);
     const route = this.validateRoute(input);
     return this.dataSource.transaction(async (manager) => {
+      const panel = await manager.findOne(PanelEntity, { where: { audience: route.audience, status: 'ACTIVE' } });
+      if (!panel) {
+        throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'مخاطب مسیر به پنل فعال متصل نیست.' });
+      }
       const clash = await manager.findOne(RouteContractEntity, {
         where: { method: route.method, pathPattern: route.pathPattern, version: route.version },
       });
@@ -667,7 +683,7 @@ export class PlatformCoreService {
 
   async decideRoute(
     authorization: string | undefined,
-    request: { method: string; pathPattern: string; version: string },
+    request: { method: string; pathPattern: string; version: string; path?: string },
   ): Promise<{
     audience: string;
     upstreamBaseUrl: string;
@@ -681,7 +697,10 @@ export class PlatformCoreService {
     if (!route) {
       throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'مسیر درگاه یافت نشد.' });
     }
-    await this.assertRouteAccess(payload, principal, route);
+    if (request.path && !this.pathMatches(route.pathPattern, request.path)) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'مسیر واقعی با قرارداد ثبت‌شده مطابقت ندارد.' });
+    }
+    await this.assertRouteAccess(payload, principal, route, request.path);
     return {
       audience: route.audience,
       upstreamBaseUrl: route.upstreamBaseUrl,
@@ -702,7 +721,7 @@ export class PlatformCoreService {
     if (method !== route.method || !this.pathMatches(route.pathPattern, request.path)) {
       throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'درخواست با قرارداد مسیر مطابقت ندارد.' });
     }
-    await this.assertRouteAccess(payload, principal, route);
+    await this.assertRouteAccess(payload, principal, route, request.path);
     const target = this.gatewayTarget(route, request.path, request.query);
     const outgoingHeaders: Record<string, string> = {
       authorization: `Bearer ${token}`,
@@ -1539,14 +1558,20 @@ export class PlatformCoreService {
       throw unauthenticated;
     }
     const principal = await this.dataSource.getRepository(PrincipalEntity).findOne({ where: { id: session.principalId } });
-    if (!principal || principal.status !== 'ACTIVE' || principal.realm !== payload.realm || principal.realm !== 'STAFF') {
+    if (!principal || principal.status !== 'ACTIVE' || principal.realm !== payload.realm ||
+      (principal.realm !== 'STAFF' && principal.realm !== 'AGENCY')) {
+      throw unauthenticated;
+    }
+    const tokenTenantId = typeof payload.tenantId === 'string' ? payload.tenantId : null;
+    if ((principal.realm === 'AGENCY' && (!principal.tenantId || tokenTenantId !== principal.tenantId)) ||
+      (principal.realm === 'STAFF' && tokenTenantId !== null)) {
       throw unauthenticated;
     }
     return { token, payload, principal };
   }
 
   private async assertRouteAccess(
-    payload: Record<string, string | number>, principal: PrincipalEntity, route: RouteContractEntity,
+    payload: Record<string, string | number>, principal: PrincipalEntity, route: RouteContractEntity, actualPath?: string,
   ): Promise<void> {
     const realm = String(payload.realm ?? '');
     if (payload.aud !== route.audience || !route.allowedRealms.split(',').includes(realm)) {
@@ -1562,23 +1587,39 @@ export class PlatformCoreService {
     if (!entitlement) {
       throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'دسترسی این پنل لغو شده است.' });
     }
+    if (principal.realm === 'AGENCY') {
+      const params = actualPath ? this.routeParams(route.pathPattern, actualPath) : null;
+      const routedTenant = route.tenantPathParam && params?.[route.tenantPathParam];
+      if (!routedTenant || routedTenant !== principal.tenantId) {
+        throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'دسترسی بین دو آژانس مجاز نیست.' });
+      }
+    }
   }
 
   private pathMatches(pattern: string, actual: string): boolean {
-    if (!actual.startsWith('/') || /%(?:2f|5c)/i.test(actual)) return false;
+    return this.routeParams(pattern, actual) !== null;
+  }
+
+  private routeParams(pattern: string, actual: string): Record<string, string> | null {
+    if (!actual.startsWith('/') || /%(?:2f|5c)/i.test(actual)) return null;
     const expected = pattern.split('/').slice(1);
     const received = actual.split('/').slice(1);
-    if (expected.length !== received.length) return false;
-    return expected.every((segment, index) => {
+    if (expected.length !== received.length) return null;
+    const params: Record<string, string> = {};
+    for (let index = 0; index < expected.length; index += 1) {
+      const segment = expected[index];
       let value: string;
       try {
         value = decodeURIComponent(received[index]);
       } catch {
-        return false;
+        return null;
       }
-      if (!/^[A-Za-z0-9._~-]+$/.test(value)) return false;
-      return /^\{[A-Za-z][A-Za-z0-9_]{0,62}\}$/.test(segment) || segment === value;
-    });
+      if (!/^[A-Za-z0-9._~-]+$/.test(value)) return null;
+      const placeholder = /^\{([A-Za-z][A-Za-z0-9_]{0,62})\}$/.exec(segment);
+      if (placeholder) params[placeholder[1]] = value;
+      else if (segment !== value) return null;
+    }
+    return params;
   }
 
   private gatewayTarget(route: RouteContractEntity, path: string, query: string): URL {
@@ -1651,8 +1692,19 @@ export class PlatformCoreService {
       throw invalid('مقصد سرویس بالادست در فهرست مجاز درگاه نیست.');
     }
     const realms = [...new Set(input.allowedRealms)];
-    if (realms.length === 0 || realms.some((realm) => !REALMS.includes(realm as PrincipalEntity['realm']))) {
+    if (realms.length !== 1 || realms.some((realm) => !GATEWAY_REALMS.includes(realm as PrincipalEntity['realm']))) {
       throw invalid('قلمرو مجاز مسیر نامعتبر است.');
+    }
+    const agencyRoute = realms[0] === 'AGENCY';
+    if ((agencyRoute && !input.audience.startsWith('agency:')) || (!agencyRoute && !input.audience.startsWith('panel:'))) {
+      throw invalid('مخاطب مسیر با قلمرو کانال سازگار نیست.');
+    }
+    if (agencyRoute) {
+      if (!input.tenantPathParam || !pathSegments.includes(`{${input.tenantPathParam}}`)) {
+        throw invalid('مسیر آژانس باید پارامتر tenantPathParam را در الگوی مسیر داشته باشد.');
+      }
+    } else if (input.tenantPathParam) {
+      throw invalid('پارامتر tenantPathParam فقط برای مسیر آژانس مجاز است.');
     }
     return {
       method,
@@ -1662,6 +1714,7 @@ export class PlatformCoreService {
       timeoutMs: input.timeoutMs,
       allowedRealms: realms.join(','),
       version: input.version,
+      tenantPathParam: input.tenantPathParam ?? null,
     };
   }
 

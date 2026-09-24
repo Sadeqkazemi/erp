@@ -62,8 +62,8 @@ class RegisterPanelDto {
   @MaxLength(120)
   titleEn!: string;
 
-  @ApiProperty({ example: 'panel:crew' })
-  @Matches(/^panel:[a-z][a-z0-9-]{1,62}$/)
+  @ApiProperty({ example: 'panel:crew', description: 'panel:* for staff, agency:* for agency channels' })
+  @Matches(/^(panel|agency):[a-z][a-z0-9-]{1,62}$/)
   audience!: string;
 }
 
@@ -89,6 +89,11 @@ class GatewayDecisionDto {
   @ApiProperty({ example: 'v1' })
   @Matches(/^v\d+$/)
   version!: string;
+
+  @ApiProperty({ required: false, example: '/v1/agencies/11111111-1111-4111-8111-111111111111/orders/42' })
+  @IsOptional()
+  @IsString()
+  path?: string;
 }
 
 class StartWorkflowDto {
@@ -311,6 +316,11 @@ class RegisterRouteDto {
   @ApiProperty({ example: 'v1' })
   @IsString()
   version!: string;
+
+  @ApiProperty({ required: false, example: 'tenantId', description: 'Required for agency routes; names the UUID path placeholder' })
+  @IsOptional()
+  @Matches(/^[A-Za-z][A-Za-z0-9_]{0,62}$/)
+  tenantPathParam?: string;
 }
 
 type AuthedRequest = Request & { principal?: AuthenticatedPrincipal; id?: string };
