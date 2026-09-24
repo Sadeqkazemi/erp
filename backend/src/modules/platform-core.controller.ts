@@ -1,7 +1,8 @@
-import { BadRequestException, Body, Controller, Get, Headers, Param, ParseUUIDPipe, Post, Req, Res, UnauthorizedException, Delete } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Headers, Param, ParseUUIDPipe, Post, Query, Req, Res, UnauthorizedException, Delete } from '@nestjs/common';
+import { Type } from 'class-transformer';
 import { ApiOperation, ApiProperty, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
-import { IsIn, IsInt, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { IsIn, IsInt, IsISO8601, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, MinLength } from 'class-validator';
 import { Request, Response } from 'express';
 import { ErrorCode } from '../common/errors';
 import { csrfCookieName, randomToken } from '../common/crypto';
@@ -140,6 +141,36 @@ class ConsentDto {
   @ApiProperty({ example: 'GRANTED', enum: ['GRANTED', 'WITHDRAWN'] })
   @IsIn(['GRANTED', 'WITHDRAWN'])
   decision!: 'GRANTED' | 'WITHDRAWN';
+}
+
+class AuditQueryDto {
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit?: number;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(256)
+  cursor?: string;
+
+  @IsOptional()
+  @Matches(/^[a-z][a-z0-9._-]{0,127}$/)
+  action?: string;
+
+  @IsOptional()
+  @Matches(/^[A-Za-z0-9._:-]{1,128}$/)
+  correlationId?: string;
+
+  @IsOptional()
+  @IsISO8601({ strict: true })
+  from?: string;
+
+  @IsOptional()
+  @IsISO8601({ strict: true })
+  to?: string;
 }
 
 class RegisterRouteDto {
@@ -388,9 +419,9 @@ export class PlatformCoreController {
 
   @Get('v1/audit-events')
   @ApiOperation({ summary: 'خواندن رویدادهای ممیزی سکو' })
-  async audit(@Req() req: AuthedRequest) {
+  async audit(@Req() req: AuthedRequest, @Query() filters: AuditQueryDto) {
     const actor = await this.actor(req);
-    const rows = await this.core.listAudit(actor);
+    const { rows, nextCursor } = await this.core.listAudit(actor, filters);
     return {
       success: true,
       data: rows.map((row) => ({
@@ -400,6 +431,7 @@ export class PlatformCoreController {
         objectId: row.objectId,
         correlationId: row.correlationId,
       })),
+      page: { nextCursor },
     };
   }
 

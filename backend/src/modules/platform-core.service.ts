@@ -69,6 +69,15 @@ export interface PublishedEvent {
   payload: Record<string, string>;
 }
 
+export interface AuditFilters {
+  limit?: number;
+  cursor?: string;
+  action?: string;
+  correlationId?: string;
+  from?: string;
+  to?: string;
+}
+
 @Injectable()
 export class PlatformCoreService {
   // Observability snapshot for tests; broker acceptance, not this list, determines delivery.
@@ -838,9 +847,49 @@ export class PlatformCoreService {
     return /^[A-Za-z0-9_-]{40,90}$/.test(token);
   }
 
-  async listAudit(actor: AuthenticatedPrincipal): Promise<AuditEventEntity[]> {
+  async listAudit(actor: AuthenticatedPrincipal, filters: AuditFilters = {}): Promise<{ rows: AuditEventEntity[]; nextCursor: string | null }> {
     this.requirePlatformAdmin(actor);
-    return this.dataSource.getRepository(AuditEventEntity).find({ order: { createdAt: 'DESC' }, take: 100 });
+    const limit = filters.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'تعداد رویدادهای درخواستی نامعتبر است.' });
+    }
+    const from = filters.from ? new Date(filters.from) : null;
+    const to = filters.to ? new Date(filters.to) : null;
+    if ((from && Number.isNaN(from.getTime())) || (to && Number.isNaN(to.getTime())) || (from && to && from > to)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'بازه زمانی ممیزی نامعتبر است.' });
+    }
+    let cursor: { createdAt: string; id: string } | null = null;
+    if (filters.cursor) {
+      try {
+        const parsed: unknown = JSON.parse(Buffer.from(filters.cursor, 'base64url').toString('utf8'));
+        const value = parsed as { createdAt?: unknown; id?: unknown };
+        if (typeof value.createdAt !== 'string' || typeof value.id !== 'string' ||
+          !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/.test(value.createdAt) ||
+          Number.isNaN(Date.parse(value.createdAt)) || !/^[0-9a-f-]{36}$/i.test(value.id)) throw new Error('invalid cursor');
+        cursor = { createdAt: value.createdAt, id: value.id };
+      } catch {
+        throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'نشانگر صفحه ممیزی نامعتبر است.' });
+      }
+    }
+    const query = this.dataSource.getRepository(AuditEventEntity).createQueryBuilder('audit');
+    if (filters.action) query.andWhere('audit.action = :action', { action: filters.action });
+    if (filters.correlationId) query.andWhere('audit.correlationId = :correlationId', { correlationId: filters.correlationId });
+    if (from) query.andWhere('audit.createdAt >= :from', { from });
+    if (to) query.andWhere('audit.createdAt <= :to', { to });
+    if (cursor) query.andWhere('(audit.createdAt < :cursorTime OR (audit.createdAt = :cursorTime AND audit.id < :cursorId))', {
+      cursorTime: cursor.createdAt, cursorId: cursor.id,
+    });
+    const found = await query
+      .addSelect("to_char(audit.createdAt AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')", 'cursorTime')
+      .orderBy('audit.createdAt', 'DESC').addOrderBy('audit.id', 'DESC').take(limit + 1).getRawAndEntities();
+    const rows = found.entities.slice(0, limit);
+    const last = rows.at(-1);
+    return {
+      rows,
+      nextCursor: found.entities.length > limit && last
+        ? Buffer.from(JSON.stringify({ createdAt: found.raw[limit - 1].cursorTime as string, id: last.id })).toString('base64url')
+        : null,
+    };
   }
 
   async controlPlaneSummary(actor: AuthenticatedPrincipal) {
