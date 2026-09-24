@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Get, Headers, Param, Post, Req, Res, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Headers, Param, ParseUUIDPipe, Post, Req, Res, UnauthorizedException, Delete } from '@nestjs/common';
 import { ApiOperation, ApiProperty, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { IsIn, IsInt, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, MinLength } from 'class-validator';
@@ -231,6 +231,14 @@ export class PlatformCoreController {
   async grant(@Req() req: AuthedRequest, @Body() dto: GrantEntitlementDto) {
     const actor = await this.requireMutation(req);
     const entitlement = await this.core.grantEntitlement(actor, dto, this.correlation(req));
+    return { success: true, data: { id: entitlement.id, status: entitlement.status } };
+  }
+
+  @Delete('v1/entitlements/:id')
+  @ApiOperation({ summary: 'لغو دسترسی پنل با ابطال فوری توکن‌های صادرشده' })
+  async revoke(@Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string) {
+    const actor = await this.requireMutation(req);
+    const entitlement = await this.core.revokeEntitlement(actor, id, this.correlation(req));
     return { success: true, data: { id: entitlement.id, status: entitlement.status } };
   }
 

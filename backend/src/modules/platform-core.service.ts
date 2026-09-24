@@ -386,6 +386,28 @@ export class PlatformCoreService {
     });
   }
 
+  async revokeEntitlement(actor: AuthenticatedPrincipal, entitlementId: string, correlationId: string): Promise<EntitlementEntity> {
+    this.requirePlatformAdmin(actor);
+    return this.dataSource.transaction(async (manager) => {
+      const entitlement = await manager.findOne(EntitlementEntity, {
+        where: { id: entitlementId }, lock: { mode: 'pessimistic_write' },
+      });
+      if (!entitlement) {
+        throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'دسترسی پنل یافت نشد.' });
+      }
+      if (entitlement.status === 'ACTIVE') {
+        entitlement.status = 'REVOKED';
+        await manager.save(entitlement);
+        await this.appendControl(manager, {
+          actorId: actor.id, action: 'entitlement.revoked', objectType: 'entitlement',
+          objectId: entitlement.id, correlationId, eventName: 'core.entitlement.revoked.v1',
+          payload: { entitlementId: entitlement.id, principalId: entitlement.principalId, panelId: entitlement.panelId },
+        });
+      }
+      return entitlement;
+    });
+  }
+
   async issuePanelToken(actor: AuthenticatedPrincipal, panelCode: string): Promise<{ token: string; audience: string; expiresAt: string }> {
     const panel = await this.dataSource.getRepository(PanelEntity).findOne({ where: { code: panelCode, status: 'ACTIVE' } });
     if (!panel) {
@@ -407,6 +429,7 @@ export class PlatformCoreService {
         iss: this.env.panelTokenIssuer,
         sub: actor.id,
         aud: panel.audience,
+        panelId: panel.id,
         realm: actor.realm,
         sid: actor.sessionId,
         jti: randomUUID(),
@@ -485,6 +508,10 @@ export class PlatformCoreService {
     if (!session || session.revokedAt || session.expiresAt.getTime() <= Date.now() || session.principalId !== payload.sub) {
       throw unauthenticated;
     }
+    const principal = await this.dataSource.getRepository(PrincipalEntity).findOne({ where: { id: session.principalId } });
+    if (!principal || principal.status !== 'ACTIVE' || principal.realm !== payload.realm || principal.realm !== 'STAFF') {
+      throw unauthenticated;
+    }
     const route = await this.dataSource.getRepository(RouteContractEntity).findOne({
       where: { method: request.method.toUpperCase(), pathPattern: request.pathPattern, version: request.version },
     });
@@ -498,6 +525,16 @@ export class PlatformCoreService {
         code: ErrorCode.FORBIDDEN,
         message: 'توکن این پنل برای این مسیر پذیرفته نیست.',
       });
+    }
+    const panelId = typeof payload.panelId === 'string' && /^[0-9a-f-]{36}$/i.test(payload.panelId) ? payload.panelId : null;
+    const panel = panelId && await this.dataSource.getRepository(PanelEntity).findOne({
+      where: { id: panelId, audience: route.audience, status: 'ACTIVE' },
+    });
+    const entitlement = panel && await this.dataSource.getRepository(EntitlementEntity).findOne({
+      where: { principalId: principal.id, panelId: panel.id, status: 'ACTIVE' },
+    });
+    if (!entitlement) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'دسترسی این پنل لغو شده است.' });
     }
     return {
       audience: route.audience,

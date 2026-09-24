@@ -14,9 +14,10 @@ The core is a control plane. These routes do not create bookings, tickets, inven
 | GET | `/v1/panels` | session | Panels the caller is entitled to. Empty list when none |
 | POST | `/v1/panels` | platform admin + CSRF + Origin + idempotency key | Register a panel. Duplicate code → `409 CONFLICT` |
 | POST | `/v1/entitlements` | platform admin + CSRF + Origin | Grant a staff panel. Self-grant and customer/agency targets are rejected. Duplicate → `409 CONFLICT` |
-| POST | `/v1/panels/:code/access-tokens` | entitled staff + CSRF + Origin | Short-lived EdDSA token (`iss`, `sub`, `aud`, `realm`, `sid`, `jti`, `iat`, `exp`). It stops working when its session is revoked |
+| DELETE | `/v1/entitlements/:id` | platform admin + CSRF + Origin | Revoke an entitlement; existing panel tokens stop passing gateway decisions |
+| POST | `/v1/panels/:code/access-tokens` | entitled staff + CSRF + Origin | Short-lived EdDSA token (`iss`, `sub`, `aud`, `realm`, `panelId`, `sid`, `jti`, `iat`, `exp`). It stops working when its session is revoked or panel access is removed |
 | POST | `/v1/gateway/routes` | platform admin + CSRF + Origin | Register a versioned route contract (`/vN/...`, `http(s)` upstream without credentials). Audited |
-| POST | `/v1/gateway/decisions` | panel bearer token | Body `{ method, pathPattern, version }`. Allow only when the token is valid, its session is live, and audience and realm match that route version |
+| POST | `/v1/gateway/decisions` | panel bearer token | Body `{ method, pathPattern, version }`. Requires a live session, active staff principal, active panel and current entitlement; audience and realm must match. Domain services still enforce object permissions |
 | POST | `/v1/gateway/routes/:id/probe` | platform admin + CSRF + Origin | Upstream timeout stays inside the gateway call. Core health stays up. Redirects are not followed |
 | POST | `/v1/workflow-runs` | staff + CSRF + Origin + idempotency key | Start workflow engine state only |
 | POST | `/v1/workflow-runs/:id/transitions` | run starter or platform admin + CSRF + Origin | Legal engine transitions only, serialised per run |
@@ -24,9 +25,9 @@ The core is a control plane. These routes do not create bookings, tickets, inven
 | GET | `/v1/consents/me` | session | Optional cookies default to denied |
 | POST | `/v1/visitor-consents` | Origin, rate limit; anonymous | Record optional cookie grant or withdrawal, set opaque HttpOnly visitor cookie |
 | GET | `/v1/visitor-consents/me` | anonymous visitor cookie | Latest optional cookie decisions; both denied when absent |
+| GET | `/v1/audit-events` | platform admin | Append-only control-plane audit (enforced by a database trigger) |
 
 Agency login at `POST /v1/sessions` requires `tenantId` (UUID). The username is looked up within that tenant; staff and customer sessions must omit `tenantId`.
-| GET | `/v1/audit-events` | platform admin | Append-only control-plane audit (enforced by a database trigger) |
 
 Idempotency keys: header `Idempotency-Key`, 8–128 characters of `[A-Za-z0-9_-]`, scoped to the caller and the operation. The same key with a different body returns `409 IDEMPOTENCY_PAYLOAD_MISMATCH`.
 

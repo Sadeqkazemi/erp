@@ -23,6 +23,7 @@
 - [x] Logout and rotation require an allowed Origin; logout clears cookies with the same attributes (Secure for `__Host-`) — e2e `requires an allowed Origin`
 - [x] Login CSRF, workload password login and TOTP replay are rejected — e2e `rejects login CSRF`
 - [x] Panel tokens are Ed25519, published via JWKS, and die with their session — e2e `signs panel tokens`, `src/common/crypto.spec.ts`
+- [x] Gateway decisions recheck active staff, panel and entitlement; admin can revoke an entitlement with an audit/outbox event, immediately denying previously issued tokens — `gateway-revocation.spec.ts`
 - [x] Audit log is append-only in the database — e2e `keeps the audit log append-only`
 - [x] Parallel outbox dispatchers do not concurrently claim the same row — e2e `never dispatches the same outbox row twice`
 - [x] The publisher retains unacknowledged rows on broker errors and retries after recovery — e2e `keeps unacknowledged events pending`
