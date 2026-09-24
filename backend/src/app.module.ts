@@ -24,7 +24,7 @@ export class AppModule implements NestModule {
           ? [
               LoggerModule.forRoot({
                 pinoHttp: {
-                  redact: ['req.headers.cookie', 'req.headers.authorization'],
+                  redact: ['req.headers.cookie', 'req.headers.authorization', 'req.headers.x-csrf-token', 'res.headers.set-cookie'],
                   genReqId: (req: IncomingMessage) => resolveRequestId(req.headers['x-request-id']),
                 },
               }),
