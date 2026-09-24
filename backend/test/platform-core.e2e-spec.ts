@@ -3,10 +3,11 @@ import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import cookieParser from 'cookie-parser';
 import { spawnSync } from 'child_process';
-import { generateKeyPairSync } from 'crypto';
+import { generateKeyPairSync, randomUUID } from 'crypto';
 import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { createServer, Server } from 'http';
 import request from 'supertest';
 import { AppModule } from '../src/app.module';
 import { loadEnv } from '../src/config/env';
@@ -14,6 +15,7 @@ import { createDataSource } from '../src/database/data-source';
 import { PrincipalEntity } from '../src/database/entities';
 import { PlatformCoreService } from '../src/modules/platform-core.service';
 import { DataSource } from 'typeorm';
+import { loadPanelTokenKeys, panelTokenJwks, PanelTokenKeys, signPanelToken } from '../src/common/crypto';
 
 const postgresBin = process.env.POSTGRES_BIN ?? 'C:\\Program Files\\PostgreSQL\\18\\bin';
 const postgresPort = 55441;
@@ -31,8 +33,64 @@ describe('platform core', () => {
   let adminPassword = '';
   let staffId = '';
   let staffTotp = '';
+  let agencyAId = '';
+  let agencyBId = '';
+  let broker: Server;
+  const delivered = new Set<string>();
+  const gatewayRequests: Array<Record<string, unknown>> = [];
+  let brokerAvailable = true;
+  let workloadTokenKeys: PanelTokenKeys;
 
   beforeAll(async () => {
+    broker = createServer((req, res) => {
+      if (!brokerAvailable) {
+        res.writeHead(503).end();
+        return;
+      }
+      if (req.url?.startsWith('/v1/gateway-fixture/')) {
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          const received = {
+            method: req.method,
+            url: req.url,
+            body: raw ? JSON.parse(raw) as unknown : null,
+            authorization: req.headers.authorization,
+            idempotencyKey: req.headers['idempotency-key'],
+            cookie: req.headers.cookie ?? null,
+            requestId: req.headers['x-request-id'],
+          };
+          gatewayRequests.push(received);
+          if (req.url?.startsWith('/v1/gateway-fixture/redirect')) {
+            res.setHeader('location', 'https://untrusted.example/redirected');
+            res.writeHead(302).end();
+            return;
+          }
+          if (req.url?.startsWith('/v1/gateway-fixture/large')) {
+            const large = JSON.stringify({ payload: 'x'.repeat(2048) });
+            res.setHeader('content-type', 'application/json');
+            res.setHeader('content-length', String(Buffer.byteLength(large)));
+            res.writeHead(200).end(large);
+            return;
+          }
+          res.setHeader('content-type', 'application/json');
+          res.setHeader('set-cookie', 'domain-session=must-not-leak');
+          res.setHeader('x-internal-secret', 'must-not-leak');
+          res.writeHead(200).end(JSON.stringify(received));
+        });
+        return;
+      }
+      const key = req.headers['idempotency-key'];
+      if (typeof key === 'string') delivered.add(key);
+      req.resume();
+      res.writeHead(202).end();
+    });
+    await new Promise<void>((resolve) => broker.listen(0, '127.0.0.1', resolve));
+    const address = broker.address();
+    if (!address || typeof address === 'string') throw new Error('Broker fixture did not bind');
+    process.env.OUTBOX_PUBLISH_URL = `http://127.0.0.1:${address.port}`;
+    process.env.OUTBOX_PUBLISH_TOKEN = 'test-token';
     const externalUrl = process.env.PLATFORM_CORE_TEST_DATABASE_URL;
     if (externalUrl) {
       process.env.DATABASE_URL = externalUrl;
@@ -73,9 +131,19 @@ describe('platform core', () => {
     process.env.NODE_ENV = 'test';
     process.env.COOKIE_SECURE = 'false';
     process.env.PANEL_TOKEN_PRIVATE_KEY = generateKeyPairSync('ed25519').privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
+    workloadTokenKeys = loadPanelTokenKeys(
+      generateKeyPairSync('ed25519').privateKey.export({ format: 'pem', type: 'pkcs8' }).toString(),
+    );
+    process.env.WORKLOAD_JWKS_JSON = JSON.stringify(panelTokenJwks(workloadTokenKeys));
+    process.env.WORKLOAD_TOKEN_ISSUER = 'https://identity.test';
+    process.env.WORKLOAD_TOKEN_AUDIENCE = 'bluejet-platform-core';
+    process.env.WORKLOAD_TOKEN_MAX_TTL_SECONDS = '300';
+    process.env.METRICS_BEARER_TOKEN = 'test-metrics-token-32-characters-minimum';
     process.env.MFA_ENCRYPTION_KEY = '11'.repeat(32);
     process.env.ALLOWED_ORIGINS = ORIGIN;
     process.env.SESSION_TTL_SECONDS = '900';
+    process.env.GATEWAY_MAX_REQUEST_BYTES = '1024';
+    process.env.GATEWAY_MAX_RESPONSE_BYTES = '1024';
     const env = loadEnv();
     // Schema is applied with the migration role when CI provides one; the app then runs as the runtime role.
     const migrator = createDataSource(process.env.PLATFORM_CORE_TEST_MIGRATION_DATABASE_URL ?? env.databaseUrl);
@@ -117,24 +185,36 @@ describe('platform core', () => {
       password: 'Customer-pass-1',
       role: 'MEMBER',
     });
+    agencyAId = (await core.createPrincipal({
+      realm: 'AGENCY', tenantId: '11111111-1111-4111-8111-111111111111',
+      username: 'agency-agent', password: 'Agency-pass-1', role: 'MEMBER',
+    })).id;
+    agencyBId = (await core.createPrincipal({
+      realm: 'AGENCY', tenantId: '22222222-2222-4222-8222-222222222222',
+      username: 'agency-agent', password: 'Agency-pass-2', role: 'MEMBER',
+    })).id;
   }, 120000);
 
   afterAll(async () => {
     await app?.close();
     await dataSource?.destroy();
+    if (broker) await new Promise<void>((resolve, reject) => broker.close((error) => error ? reject(error) : resolve()));
     if (dataDir && ownsCluster) {
       spawnSync(join(postgresBin, `pg_ctl${exe}`), ['-D', dataDir, '-w', '-m', 'fast', 'stop'], { encoding: 'utf8' });
     }
   });
 
-  async function login(username: string, password: string, totp?: string) {
+  async function login(
+    username: string, password: string, totp?: string,
+    realm: 'STAFF' | 'CUSTOMER' | 'AGENCY' = totp ? 'STAFF' : 'CUSTOMER', tenantId?: string,
+  ) {
     // Each TOTP step is single-use; tests log in repeatedly within one step, so clear the marker first.
     if (totp) {
       await dataSource.query('UPDATE principals SET "lastTotpStep" = NULL WHERE username = $1', [username]);
     }
     const response = await request(app.getHttpServer())
       .post('/v1/sessions')
-      .send({ realm: totp ? 'STAFF' : 'CUSTOMER', username, password, totp: totp ? core.currentTotp(totp) : undefined })
+      .send({ realm, tenantId, username, password, totp: totp ? core.currentTotp(totp) : undefined })
       .expect(201);
     const cookie = response.headers['set-cookie'];
     const csrf = response.body.data.csrfToken as string;
@@ -147,6 +227,17 @@ describe('platform core', () => {
       .send({ realm: 'STAFF', username: 'platform-admin', password: adminPassword })
       .expect(401);
     expect(response.body.error.code).toBe('INVALID_CREDENTIALS');
+  });
+
+  it('exposes no telemetry without the dedicated bearer and returns only control-plane metrics', async () => {
+    await request(app.getHttpServer()).get('/metrics').expect(401);
+    const response = await request(app.getHttpServer()).get('/metrics')
+      .set('Authorization', 'Bearer test-metrics-token-32-characters-minimum')
+      .expect(200);
+    expect(response.headers['content-type']).toContain('text/plain');
+    expect(response.text).toContain('bluejet_core_up 1');
+    expect(response.text).toContain('bluejet_core_outbox_events{state="pending"}');
+    expect(response.text).not.toMatch(/sales|booking|payment|passenger/i);
   });
 
   it('returns an empty launcher until another admin grants a panel', async () => {
@@ -257,6 +348,61 @@ describe('platform core', () => {
       .expect(201);
     expect(allowed.body.data.audience).toBe('panel:crew');
 
+    const gatewayRoute = await request(app.getHttpServer())
+      .post('/v1/gateway/routes')
+      .set('Cookie', admin.cookie)
+      .set('Origin', ORIGIN)
+      .set('X-CSRF-Token', admin.csrf)
+      .send({
+        method: 'POST',
+        pathPattern: '/v1/gateway-fixture/{id}',
+        upstreamBaseUrl: new URL(process.env.OUTBOX_PUBLISH_URL ?? '').origin,
+        audience: 'panel:crew',
+        timeoutMs: 500,
+        allowedRealms: 'STAFF',
+        version: 'v1',
+      })
+      .expect(201);
+    const forwarded = await request(app.getHttpServer())
+      .post(`/v1/gateway/routes/${gatewayRoute.body.data.id}/forward/v1/gateway-fixture/abc-123?day=1`)
+      .set('Authorization', `Bearer ${token.body.data.token}`)
+      .set('Cookie', 'untrusted-domain-cookie=secret')
+      .set('Idempotency-Key', 'domain-write-0001')
+      .send({ action: 'inspect' })
+      .expect(200);
+    expect(forwarded.body).toMatchObject({
+      method: 'POST', url: '/v1/gateway-fixture/abc-123?day=1', body: { action: 'inspect' },
+      idempotencyKey: 'domain-write-0001', cookie: null,
+    });
+    expect(forwarded.body.authorization).toMatch(/^Bearer /);
+    expect(forwarded.body.requestId).toMatch(/^[A-Za-z0-9._:-]{8,128}$/);
+    expect(forwarded.headers['set-cookie']).toBeUndefined();
+    expect(forwarded.headers['x-internal-secret']).toBeUndefined();
+    expect(gatewayRequests).toHaveLength(1);
+    await request(app.getHttpServer())
+      .post(`/v1/gateway/routes/${gatewayRoute.body.data.id}/forward/v1/not-the-contract`)
+      .set('Authorization', `Bearer ${token.body.data.token}`)
+      .send({ action: 'deny' })
+      .expect(403);
+    const redirect = await request(app.getHttpServer())
+      .post(`/v1/gateway/routes/${gatewayRoute.body.data.id}/forward/v1/gateway-fixture/redirect`)
+      .set('Authorization', `Bearer ${token.body.data.token}`)
+      .send({ action: 'redirect' })
+      .expect(502);
+    expect(redirect.body.error.code).toBe('UPSTREAM_REJECTED');
+    const large = await request(app.getHttpServer())
+      .post(`/v1/gateway/routes/${gatewayRoute.body.data.id}/forward/v1/gateway-fixture/large`)
+      .set('Authorization', `Bearer ${token.body.data.token}`)
+      .send({ action: 'large' })
+      .expect(502);
+    expect(large.body.error.code).toBe('PAYLOAD_TOO_LARGE');
+    const oversized = await request(app.getHttpServer())
+      .post(`/v1/gateway/routes/${gatewayRoute.body.data.id}/forward/v1/gateway-fixture/oversized`)
+      .set('Authorization', `Bearer ${token.body.data.token}`)
+      .send({ payload: 'x'.repeat(1500) })
+      .expect(413);
+    expect(oversized.body.error.code).toBe('PAYLOAD_TOO_LARGE');
+
     const customerSession = await login('09120000000', 'Customer-pass-1');
     const customerPanels = await request(app.getHttpServer())
       .post('/v1/panels')
@@ -290,7 +436,13 @@ describe('platform core', () => {
       .expect(409);
     expect(probe.body.error.code).toBe('UPSTREAM_TIMEOUT');
     const health = await request(app.getHttpServer()).get('/health').expect(200);
-    expect(health.body.data.status).toBe('ok');
+    expect(health.body.data.status).toBe('ready');
+    await request(app.getHttpServer()).get('/health/ready').expect(200, {
+      success: true, data: { status: 'ready', service: 'platform-core' },
+    });
+    await request(app.getHttpServer()).get('/health/live').expect(200, {
+      success: true, data: { status: 'live', service: 'platform-core' },
+    });
   });
 
   it('rotates the session and records consent withdrawal', async () => {
@@ -343,11 +495,11 @@ describe('platform core', () => {
       .expect(409);
     expect(illegal.body.error.code).toBe('ILLEGAL_TRANSITION');
     const first = await core.dispatchOutbox();
-    const published = core.publishedEvents().length;
+    const published = delivered.size;
     const second = await core.dispatchOutbox();
     expect(first).toBeGreaterThan(0);
     expect(second).toBe(0);
-    expect(core.publishedEvents().length).toBe(published);
+    expect(delivered.size).toBe(published);
   });
 
   describe('hardening regressions', () => {
@@ -529,6 +681,115 @@ describe('platform core', () => {
       await decide(token).expect(401);
     });
 
+    it('authenticates the owning workload and records an immutable idempotent workflow callback', async () => {
+      const admin = await adminLogin();
+      const srv = app.getHttpServer();
+      await mutate(request(srv).post('/v1/panels'), admin)
+        .set('Idempotency-Key', 'panel-callback-01')
+        .send({
+          code: 'callback-test', ownerService: 'callback-service', classification: 'INTERNAL',
+          titleFa: 'آزمون بازگشت', titleEn: 'Callback test', audience: 'panel:callback-test',
+        })
+        .expect(201);
+      const registered = await mutate(request(srv).post('/v1/workload-identities'), admin)
+        .set('Idempotency-Key', 'workload-callback-01')
+        .send({ service: 'callback-service' })
+        .expect(201);
+
+      const started = await mutate(request(srv).post('/v1/workflow-runs'), admin)
+        .set('Idempotency-Key', 'wf-callback-0001')
+        .send({ definitionKey: 'callback.test.v1', ownerService: 'callback-service', correlationId: 'corr-callback-1' })
+        .expect(201);
+      const runId = started.body.data.id as string;
+      await mutate(request(srv).post(`/v1/workflow-runs/${runId}/transitions`), admin).send({ to: 'RUNNING' }).expect(201);
+      await mutate(request(srv).post(`/v1/workflow-runs/${runId}/steps`), admin)
+        .set('Idempotency-Key', 'step-callback-001')
+        .send({ stepKey: 'reserve', timeoutSeconds: 300 })
+        .expect(201);
+      await mutate(request(srv).post(`/v1/workflow-runs/${runId}/steps/reserve/transitions`), admin)
+        .send({ to: 'RUNNING' })
+        .expect(201);
+
+      const now = Math.floor(Date.now() / 1000);
+      const bearer = signPanelToken({
+        iss: 'https://identity.test', aud: 'bluejet-platform-core', sub: registered.body.data.id as string,
+        service: 'callback-service', jti: randomUUID(), iat: now, nbf: now, exp: now + 120,
+      }, workloadTokenKeys);
+      const callbackBody = {
+        result: 'SUCCEEDED', evidenceId: 'domain:evidence:callback-0001', occurredAt: new Date().toISOString(),
+      };
+      const sendCallback = (body = callbackBody) => request(srv)
+        .post(`/v1/workflow-runs/${runId}/steps/reserve/callbacks`)
+        .set('Authorization', `Bearer ${bearer}`)
+        .set('Idempotency-Key', 'callback-result-0001')
+        .send(body);
+      const first = await sendCallback().expect(201);
+      const replay = await sendCallback().expect(201);
+      expect(replay.body.data.callbackId).toBe(first.body.data.callbackId);
+      const mismatch = await sendCallback({ ...callbackBody, evidenceId: 'domain:evidence:callback-0002' }).expect(409);
+      expect(mismatch.body.error.code).toBe('IDEMPOTENCY_PAYLOAD_MISMATCH');
+
+      const foreignRun = await mutate(request(srv).post('/v1/workflow-runs'), admin)
+        .set('Idempotency-Key', 'wf-callback-foreign')
+        .send({ definitionKey: 'foreign.test.v1', ownerService: 'another-service', correlationId: 'corr-callback-foreign' })
+        .expect(201);
+      await mutate(request(srv).post(`/v1/workflow-runs/${foreignRun.body.data.id}/transitions`), admin)
+        .send({ to: 'RUNNING' }).expect(201);
+      await mutate(request(srv).post(`/v1/workflow-runs/${foreignRun.body.data.id}/steps`), admin)
+        .set('Idempotency-Key', 'step-callback-foreign')
+        .send({ stepKey: 'reserve', timeoutSeconds: 300 }).expect(201);
+      const denied = await request(srv)
+        .post(`/v1/workflow-runs/${foreignRun.body.data.id}/steps/reserve/callbacks`)
+        .set('Authorization', `Bearer ${bearer}`)
+        .set('Idempotency-Key', 'callback-owner-deny')
+        .send(callbackBody)
+        .expect(403);
+      expect(denied.body.error.code).toBe('FORBIDDEN');
+
+      await expect(dataSource.query(
+        'UPDATE workflow_step_callbacks SET "evidenceId" = $1 WHERE id = $2', ['tampered', first.body.data.callbackId],
+      )).rejects.toThrow(/append-only/);
+      const [{ n }] = (await dataSource.query(
+        'SELECT count(*)::int AS n FROM workflow_step_callbacks WHERE id = $1', [first.body.data.callbackId],
+      )) as { n: number }[];
+      expect(n).toBe(1);
+    });
+
+    it('binds agency gateway access to the signed tenant and denies cross-agency object paths', async () => {
+      const admin = await adminLogin();
+      const srv = app.getHttpServer();
+      await mutate(request(srv).post('/v1/panels'), admin)
+        .set('Idempotency-Key', 'panel-agency-0001')
+        .send({
+          code: 'agency-orders', ownerService: 'agency-service', classification: 'CONFIDENTIAL',
+          titleFa: 'سفارش‌های آژانس', titleEn: 'Agency orders', audience: 'agency:orders',
+        }).expect(201);
+      const wrongRealm = await mutate(request(srv).post('/v1/entitlements'), admin)
+        .send({ principalId: staffId, panelCode: 'agency-orders' }).expect(403);
+      expect(wrongRealm.body.error.code).toBe('REALM_REJECTED');
+      await mutate(request(srv).post('/v1/entitlements'), admin)
+        .send({ principalId: agencyAId, panelCode: 'agency-orders' }).expect(201);
+      await mutate(request(srv).post('/v1/entitlements'), admin)
+        .send({ principalId: agencyBId, panelCode: 'agency-orders' }).expect(201);
+      await mutate(request(srv).post('/v1/gateway/routes'), admin).send({
+        method: 'GET', pathPattern: '/v1/agencies/{tenantId}/orders/{id}',
+        upstreamBaseUrl: 'http://127.0.0.1:9', audience: 'agency:orders', timeoutMs: 50,
+        allowedRealms: 'AGENCY', version: 'v1', tenantPathParam: 'tenantId',
+      }).expect(201);
+
+      const agencyA = await login(
+        'agency-agent', 'Agency-pass-1', undefined, 'AGENCY', '11111111-1111-4111-8111-111111111111',
+      );
+      const issued = await mutate(request(srv).post('/v1/panels/agency-orders/access-tokens'), agencyA).expect(201);
+      const decide = (path?: string) => request(srv).post('/v1/gateway/decisions')
+        .set('Authorization', `Bearer ${issued.body.data.token}`)
+        .send({ method: 'GET', pathPattern: '/v1/agencies/{tenantId}/orders/{id}', version: 'v1', path });
+      await decide('/v1/agencies/11111111-1111-4111-8111-111111111111/orders/42').expect(201);
+      const foreign = await decide('/v1/agencies/22222222-2222-4222-8222-222222222222/orders/42').expect(403);
+      expect(foreign.body.error.code).toBe('FORBIDDEN');
+      await decide().expect(403);
+    });
+
     it('keeps the audit log append-only at the database level', async () => {
       await expect(dataSource.query('UPDATE audit_events SET action = $1', ['tampered'])).rejects.toThrow(/append-only/);
       // Under the runtime role DELETE is refused by grants before the trigger fires; either layer suffices.
@@ -539,12 +800,24 @@ describe('platform core', () => {
       const admin = await adminLogin();
       await mutate(request(app.getHttpServer()).post('/v1/panels'), admin).set('Idempotency-Key', 'panel-outbox-01').send(panelBody('outbox'));
       const [{ n: pending }] = (await dataSource.query('SELECT count(*)::int AS n FROM outbox_events WHERE "publishedAt" IS NULL')) as { n: number }[];
-      const before = core.publishedEvents().length;
+      const before = delivered.size;
       const counts = await Promise.all([core.dispatchOutbox(), core.dispatchOutbox(), core.dispatchOutbox()]);
       expect(counts.reduce((a, b) => a + b, 0)).toBe(pending);
-      expect(core.publishedEvents().length - before).toBe(pending);
+      expect(delivered.size - before).toBe(pending);
       const [{ n: left }] = (await dataSource.query('SELECT count(*)::int AS n FROM outbox_events WHERE "publishedAt" IS NULL')) as { n: number }[];
       expect(left).toBe(0);
+    });
+    it('keeps unacknowledged events pending and retries after the broker recovers', async () => {
+      const admin = await adminLogin();
+      await mutate(request(app.getHttpServer()).post('/v1/panels'), admin).set('Idempotency-Key', 'panel-retry-01').send(panelBody('retry'));
+      brokerAvailable = false;
+      expect(await core.dispatchOutbox()).toBe(0);
+      const [{ n: pending }] = (await dataSource.query('SELECT count(*)::int AS n FROM outbox_events WHERE "publishedAt" IS NULL')) as { n: number }[];
+      expect(pending).toBeGreaterThan(0);
+      brokerAvailable = true;
+      // Advance the durable retry schedule without a wall-clock sleep; immediate retries must remain blocked by backoff.
+      await dataSource.query('UPDATE outbox_events SET "nextAttemptAt" = now() WHERE "publishedAt" IS NULL');
+      expect(await core.dispatchOutbox()).toBe(pending);
     });
   });
 });

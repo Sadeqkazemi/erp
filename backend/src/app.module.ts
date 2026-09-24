@@ -11,6 +11,7 @@ import { CORE_ENV, CoreEnv } from './config/env';
 import { HealthController } from './modules/health.controller';
 import { PlatformCoreController } from './modules/platform-core.controller';
 import { PlatformCoreService } from './modules/platform-core.service';
+import { MetricsController } from './modules/metrics.controller';
 
 @Module({})
 export class AppModule implements NestModule {
@@ -24,7 +25,7 @@ export class AppModule implements NestModule {
           ? [
               LoggerModule.forRoot({
                 pinoHttp: {
-                  redact: ['req.headers.cookie', 'req.headers.authorization'],
+                  redact: ['req.headers.cookie', 'req.headers.authorization', 'req.headers.x-csrf-token', 'res.headers.set-cookie'],
                   genReqId: (req: IncomingMessage) => resolveRequestId(req.headers['x-request-id']),
                 },
               }),
@@ -32,7 +33,7 @@ export class AppModule implements NestModule {
           : []),
         ThrottlerModule.forRoot([{ ttl: 60_000, limit: 120 }]),
       ],
-      controllers: [HealthController, PlatformCoreController],
+      controllers: [HealthController, MetricsController, PlatformCoreController],
       providers: [
         { provide: CORE_ENV, useValue: env },
         { provide: DataSource, useValue: dataSource },

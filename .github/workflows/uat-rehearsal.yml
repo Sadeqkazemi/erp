@@ -1,0 +1,163 @@
+name: uat-rehearsal
+
+run-name: UAT rehearsal for ${{ inputs.source_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-character commit SHA already merged to main
+        required: true
+        type: string
+      source_run_id:
+        description: Successful build-evidence workflow run ID for the commit
+        required: true
+        type: string
+      confirm_masked_data:
+        description: Confirm the UAT database contains masked or synthetic data only
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  actions: read
+  attestations: read
+  contents: read
+
+concurrency:
+  group: platform-core-uat-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  verify-and-rehearse:
+    name: Verify artifact and rehearse UAT
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: uat-rehearsal
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+    steps:
+      - name: Enforce explicit UAT safety confirmation
+        env:
+          CONFIRM_MASKED_DATA: ${{ inputs.confirm_masked_data }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRM_MASKED_DATA" = "true" || {
+            echo "UAT rehearsal requires masked or synthetic data." >&2
+            exit 1
+          }
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "source_sha must be a full lowercase commit SHA." >&2
+            exit 1
+          }
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]] || {
+            echo "source_run_id must be numeric." >&2
+            exit 1
+          }
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+
+      - name: Require an exact commit already present on main
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/main || {
+            echo "The requested commit is not present on main." >&2
+            exit 1
+          }
+
+      - name: Verify source build workflow identity and result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID")"
+          test "$(jq -r .name <<<"$run_json")" = "build-evidence"
+          test "$(jq -r .event <<<"$run_json")" = "push"
+          test "$(jq -r .head_branch <<<"$run_json")" = "main"
+          test "$(jq -r .head_sha <<<"$run_json")" = "$SOURCE_SHA"
+          test "$(jq -r .conclusion <<<"$run_json")" = "success"
+
+      - uses: actions/download-artifact@974686ed5098c7f9c9289ec946b9058e496a2561
+        with:
+          github-token: ${{ github.token }}
+          name: platform-core-build-${{ inputs.source_sha }}
+          path: attested
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Verify digest, SBOM and GitHub provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd attested
+          sha256sum -c platform-core-build.sha256
+          test -s platform-core-sbom.json
+          jq -e '.bomFormat == "CycloneDX" and (.components | type == "array")' platform-core-sbom.json >/dev/null
+          gh attestation verify platform-core-build.tgz --repo "$GITHUB_REPOSITORY"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install migration tooling from the exact source commit
+        working-directory: backend
+        run: npm ci
+
+      - name: Apply forward-only migrations with the UAT migration role
+        working-directory: backend
+        env:
+          DATABASE_MIGRATION_URL: ${{ secrets.UAT_REHEARSAL_MIGRATION_DATABASE_URL }}
+        run: npm run migration:run
+
+      - name: Install only runtime dependencies from the verified artifact
+        run: |
+          set -euo pipefail
+          mkdir artifact-runtime
+          tar -xzf attested/platform-core-build.tgz -C artifact-runtime
+          cd artifact-runtime
+          npm ci --omit=dev
+
+      - name: Boot and probe the verified artifact with the runtime role
+        working-directory: artifact-runtime
+        env:
+          ALLOWED_ORIGINS: http://127.0.0.1:3199
+          ALLOW_TEST_BOOTSTRAP: "false"
+          COOKIE_SECURE: "false"
+          DATABASE_URL: ${{ secrets.UAT_REHEARSAL_RUNTIME_DATABASE_URL }}
+          EXPOSE_API_DOCS: "false"
+          NODE_ENV: test
+          PORT: "3199"
+        run: |
+          set -euo pipefail
+          export MFA_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+          export PANEL_TOKEN_PRIVATE_KEY="$(openssl genpkey -algorithm ED25519 2>/dev/null)"
+          node dist/main.js >platform-core.log 2>&1 &
+          core_pid=$!
+          trap 'kill "$core_pid" 2>/dev/null || true' EXIT
+
+          ready=false
+          for _ in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:3199/health/ready \
+              | jq -e '.success == true and .data.status == "ready" and .data.service == "platform-core"' >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" != "true" ]; then
+            sed -n '1,200p' platform-core.log >&2
+            exit 1
+          fi
+
+          curl --fail --silent http://127.0.0.1:3199/health/live \
+            | jq -e '.success == true and .data.status == "live"' >/dev/null

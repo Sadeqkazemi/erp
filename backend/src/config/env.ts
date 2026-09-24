@@ -1,4 +1,4 @@
-import { loadPanelTokenKeys, PanelTokenKeys } from '../common/crypto';
+import { loadPanelTokenKeys, loadWorkloadTokenVerifier, PanelTokenKeys, WorkloadTokenVerifier } from '../common/crypto';
 
 export const CORE_ENV = Symbol('CORE_ENV');
 
@@ -15,6 +15,14 @@ export interface CoreEnv {
   allowedOrigins: string[];
   allowTestBootstrap: boolean;
   exposeApiDocs: boolean;
+  outboxPublishUrl: string | null;
+  outboxPublishToken: string | null;
+  workflowDefinitionsRequired: boolean;
+  gatewayAllowedHosts: string[];
+  gatewayMaxRequestBytes: number;
+  gatewayMaxResponseBytes: number;
+  workloadTokenVerifier: WorkloadTokenVerifier | null;
+  metricsBearerToken: string | null;
 }
 
 function parseBoolean(source: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
@@ -71,6 +79,48 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): CoreEnv {
   if (production && origins.some((origin) => !origin.startsWith('https://'))) {
     throw new Error('ALLOWED_ORIGINS must use https in production');
   }
+  const outboxPublishUrl = source.OUTBOX_PUBLISH_URL?.trim() || null;
+  const outboxPublishToken = source.OUTBOX_PUBLISH_TOKEN?.trim() || null;
+  if (outboxPublishUrl && (!/^https?:\/\//.test(outboxPublishUrl) || (production && !outboxPublishUrl.startsWith('https://')))) {
+    throw new Error('OUTBOX_PUBLISH_URL must be an HTTP endpoint (HTTPS in production)');
+  }
+  if (production && (!outboxPublishUrl || !outboxPublishToken)) {
+    throw new Error('OUTBOX_PUBLISH_URL and OUTBOX_PUBLISH_TOKEN are required in production');
+  }
+  const gatewayAllowedHosts = (source.GATEWAY_ALLOWED_HOSTS ?? '')
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) => item.length > 0);
+  if (gatewayAllowedHosts.some((host) => !/^[a-z0-9.-]+(?::\d{1,5})?$/.test(host))) {
+    throw new Error('GATEWAY_ALLOWED_HOSTS must contain exact host or host:port values');
+  }
+  if (production && gatewayAllowedHosts.length === 0) {
+    throw new Error('GATEWAY_ALLOWED_HOSTS is required in production');
+  }
+  const workloadJwks = source.WORKLOAD_JWKS_JSON?.trim() || null;
+  const workloadIssuer = source.WORKLOAD_TOKEN_ISSUER?.trim() || null;
+  const workloadAudience = source.WORKLOAD_TOKEN_AUDIENCE?.trim() || null;
+  const workloadSettings = [workloadJwks, workloadIssuer, workloadAudience];
+  if (workloadSettings.some(Boolean) && !workloadSettings.every(Boolean)) {
+    throw new Error('WORKLOAD_JWKS_JSON, WORKLOAD_TOKEN_ISSUER and WORKLOAD_TOKEN_AUDIENCE must be configured together');
+  }
+  if (production && (!workloadJwks || !workloadIssuer || !workloadAudience)) {
+    throw new Error('WORKLOAD_JWKS_JSON, WORKLOAD_TOKEN_ISSUER and WORKLOAD_TOKEN_AUDIENCE are required in production');
+  }
+  const workloadMaxTtl = parsePositiveInt(source, 'WORKLOAD_TOKEN_MAX_TTL_SECONDS', 300);
+  if (workloadMaxTtl < 30 || workloadMaxTtl > 900) {
+    throw new Error('WORKLOAD_TOKEN_MAX_TTL_SECONDS must be between 30 and 900');
+  }
+  const workloadTokenVerifier = workloadJwks && workloadIssuer && workloadAudience
+    ? loadWorkloadTokenVerifier(workloadJwks, workloadIssuer, workloadAudience, workloadMaxTtl)
+    : null;
+  const metricsBearerToken = source.METRICS_BEARER_TOKEN?.trim() || null;
+  if (metricsBearerToken && metricsBearerToken.length < 32) {
+    throw new Error('METRICS_BEARER_TOKEN must contain at least 32 characters');
+  }
+  if (production && !metricsBearerToken) {
+    throw new Error('METRICS_BEARER_TOKEN is required in production');
+  }
   return {
     nodeEnv,
     port: parsePositiveInt(source, 'PORT', 3000),
@@ -84,6 +134,14 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): CoreEnv {
     allowedOrigins: origins,
     allowTestBootstrap,
     exposeApiDocs,
+    outboxPublishUrl,
+    outboxPublishToken,
+    workflowDefinitionsRequired: production,
+    gatewayAllowedHosts,
+    gatewayMaxRequestBytes: parsePositiveInt(source, 'GATEWAY_MAX_REQUEST_BYTES', 262_144),
+    gatewayMaxResponseBytes: parsePositiveInt(source, 'GATEWAY_MAX_RESPONSE_BYTES', 1_048_576),
+    workloadTokenVerifier,
+    metricsBearerToken,
   };
 }
 
@@ -99,7 +157,8 @@ export function assertProductionSafe(env: CoreEnv): void {
   if (env.nodeEnv !== 'production') {
     return;
   }
-  if (!env.cookieSecure || env.allowTestBootstrap || env.exposeApiDocs) {
+  if (!env.cookieSecure || env.allowTestBootstrap || env.exposeApiDocs || env.gatewayAllowedHosts.length === 0 ||
+    !env.metricsBearerToken) {
     throw new Error('Production cookie, bootstrap and API docs flags are unsafe');
   }
 }

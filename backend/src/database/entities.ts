@@ -1,7 +1,6 @@
 import { Column, CreateDateColumn, Entity, Index, PrimaryColumn, UpdateDateColumn, VersionColumn } from 'typeorm';
 
 @Entity({ name: 'principals' })
-@Index(['realm', 'username'], { unique: true })
 export class PrincipalEntity {
   @PrimaryColumn('uuid')
   id!: string;
@@ -11,6 +10,9 @@ export class PrincipalEntity {
 
   @Column({ type: 'varchar' })
   username!: string;
+
+  @Column({ type: 'uuid', nullable: true })
+  tenantId!: string | null;
 
   @Column({ type: 'varchar' })
   passwordHash!: string;
@@ -78,7 +80,7 @@ export class PanelEntity {
   @Column({ type: 'varchar' })
   titleEn!: string;
 
-  @Column({ type: 'varchar' })
+  @Column({ type: 'varchar', unique: true })
   audience!: string;
 
   @Column({ type: 'varchar', default: 'ACTIVE' })
@@ -137,6 +139,97 @@ export class RouteContractEntity {
   @Column({ type: 'varchar' })
   version!: string;
 
+  @Column({ type: 'varchar', nullable: true })
+  tenantPathParam!: string | null;
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  createdAt!: Date;
+}
+
+@Entity({ name: 'service_observations' })
+@Index(['routeId', 'observedAt'])
+export class ServiceObservationEntity {
+  @PrimaryColumn('uuid')
+  id!: string;
+
+  @Column('uuid')
+  routeId!: string;
+
+  @Column({ type: 'varchar' })
+  status!: 'UP' | 'DOWN';
+
+  @Column({ type: 'int', nullable: true })
+  httpStatus!: number | null;
+
+  @Column({ type: 'int' })
+  latencyMs!: number;
+
+  @Column({ type: 'varchar', nullable: true })
+  errorCode!: string | null;
+
+  @Column({ type: 'varchar' })
+  source!: 'MANUAL_PROBE';
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  observedAt!: Date;
+}
+
+@Entity({ name: 'service_operational_profiles' })
+@Index(['ownerService', 'version'], { unique: true })
+export class ServiceOperationalProfileEntity {
+  @PrimaryColumn('uuid')
+  id!: string;
+
+  @Column({ type: 'varchar' })
+  ownerService!: string;
+
+  @Column({ type: 'int' })
+  version!: number;
+
+  @Column({ type: 'varchar' })
+  ownerTeam!: string;
+
+  @Column({ type: 'varchar' })
+  onCallRoute!: string;
+
+  @Column({ type: 'varchar' })
+  runbookUrl!: string;
+
+  @Column({ type: 'int' })
+  availabilityTargetBps!: number;
+
+  @Column({ type: 'int' })
+  latencyP95TargetMs!: number;
+
+  @Column({ type: 'int' })
+  rtoMinutes!: number;
+
+  @Column({ type: 'int' })
+  rpoMinutes!: number;
+
+  @Column('uuid')
+  recordedByPrincipalId!: string;
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  recordedAt!: Date;
+}
+
+export interface WorkflowDefinitionStep { stepKey: string; timeoutSeconds: number }
+
+@Entity({ name: 'workflow_definitions' })
+export class WorkflowDefinitionEntity {
+  @PrimaryColumn('uuid')
+  id!: string;
+
+  @Column({ type: 'varchar', unique: true })
+  definitionKey!: string;
+
+  @Column({ type: 'varchar' })
+  ownerService!: string;
+
+  @Column({ type: 'jsonb' })
+  steps!: WorkflowDefinitionStep[];
+
   @CreateDateColumn({ type: 'timestamptz' })
   createdAt!: Date;
 }
@@ -181,6 +274,65 @@ export class WorkflowRunEntity {
   updatedAt!: Date;
 }
 
+@Entity({ name: 'workflow_steps' })
+@Index(['workflowRunId', 'stepKey'], { unique: true })
+export class WorkflowStepEntity {
+  @PrimaryColumn('uuid')
+  id!: string;
+
+  @Column('uuid')
+  workflowRunId!: string;
+
+  @Column({ type: 'varchar' })
+  stepKey!: string;
+
+  @Column({ type: 'varchar' })
+  status!: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'COMPENSATING' | 'COMPENSATED';
+
+  @Column({ type: 'int', default: 0 })
+  attempt!: number;
+
+  @Column({ type: 'timestamptz' })
+  deadlineAt!: Date;
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  createdAt!: Date;
+
+  @UpdateDateColumn({ type: 'timestamptz' })
+  updatedAt!: Date;
+}
+
+@Entity({ name: 'workflow_step_callbacks' })
+@Index(['reportedByPrincipalId', 'workflowRunId', 'workflowStepId', 'idempotencyKey'], { unique: true })
+export class WorkflowStepCallbackEntity {
+  @PrimaryColumn('uuid')
+  id!: string;
+
+  @Column('uuid')
+  workflowRunId!: string;
+
+  @Column('uuid')
+  workflowStepId!: string;
+
+  @Column('uuid')
+  reportedByPrincipalId!: string;
+
+  @Column({ type: 'varchar' })
+  result!: 'SUCCEEDED' | 'FAILED' | 'COMPENSATED';
+
+  @Column({ type: 'varchar' })
+  evidenceId!: string;
+
+  @Column({ type: 'timestamptz' })
+  occurredAt!: Date;
+
+  @Column({ type: 'varchar' })
+  idempotencyKey!: string;
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  receivedAt!: Date;
+}
+
 @Entity({ name: 'audit_events' })
 export class AuditEventEntity {
   @PrimaryColumn('uuid')
@@ -188,6 +340,9 @@ export class AuditEventEntity {
 
   @Column({ type: 'uuid', nullable: true })
   actorPrincipalId!: string | null;
+
+  @Column({ type: 'uuid', nullable: true })
+  tenantId!: string | null;
 
   @Column({ type: 'varchar' })
   action!: string;
@@ -231,6 +386,12 @@ export class OutboxEventEntity {
   @Column({ type: 'varchar', nullable: true })
   lastError!: string | null;
 
+  @Column({ type: 'timestamptz', nullable: true })
+  nextAttemptAt!: Date | null;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  deadLetterAt!: Date | null;
+
   @CreateDateColumn({ type: 'timestamptz' })
   createdAt!: Date;
 }
@@ -242,6 +403,27 @@ export class ConsentRecordEntity {
 
   @Column('uuid')
   principalId!: string;
+
+  @Column({ type: 'varchar' })
+  purpose!: 'ANALYTICS' | 'ADVERTISING';
+
+  @Column({ type: 'varchar' })
+  policyVersion!: string;
+
+  @Column({ type: 'varchar' })
+  decision!: 'GRANTED' | 'WITHDRAWN';
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  recordedAt!: Date;
+}
+
+@Entity({ name: 'visitor_consents' })
+export class VisitorConsentEntity {
+  @PrimaryColumn('uuid')
+  id!: string;
+
+  @Column({ type: 'varchar' })
+  visitorHash!: string;
 
   @Column({ type: 'varchar' })
   purpose!: 'ANALYTICS' | 'ADVERTISING';

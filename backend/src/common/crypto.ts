@@ -5,6 +5,7 @@ import {
   createHmac,
   createPrivateKey,
   createPublicKey,
+  JsonWebKey,
   KeyObject,
   randomBytes,
   sign,
@@ -151,6 +152,13 @@ export interface PanelTokenKeys {
   kid: string;
 }
 
+export interface WorkloadTokenVerifier {
+  keys: Map<string, KeyObject>;
+  issuer: string;
+  audience: string;
+  maxTtlSeconds: number;
+}
+
 export function loadPanelTokenKeys(privateKeyPem: string): PanelTokenKeys {
   const privateKey = createPrivateKey(privateKeyPem);
   if (privateKey.asymmetricKeyType !== 'ed25519') {
@@ -199,4 +207,55 @@ export function verifyPanelToken(
     throw new Error('expired');
   }
   return payload;
+}
+
+export function loadWorkloadTokenVerifier(
+  jwksJson: string, issuer: string, audience: string, maxTtlSeconds: number,
+): WorkloadTokenVerifier {
+  if (!issuer || !audience || !Number.isInteger(maxTtlSeconds) || maxTtlSeconds < 30 || maxTtlSeconds > 900) {
+    throw new Error('Workload token issuer, audience and max TTL are invalid');
+  }
+  const parsed = JSON.parse(jwksJson) as { keys?: unknown };
+  if (!Array.isArray(parsed.keys) || parsed.keys.length < 1 || parsed.keys.length > 10) {
+    throw new Error('WORKLOAD_JWKS_JSON must contain 1 to 10 public keys');
+  }
+  const keys = new Map<string, KeyObject>();
+  for (const value of parsed.keys) {
+    const jwk = value as Record<string, unknown>;
+    if (jwk.kty !== 'OKP' || jwk.crv !== 'Ed25519' || jwk.alg !== 'EdDSA' || jwk.use !== 'sig' ||
+      typeof jwk.kid !== 'string' || !/^[A-Za-z0-9_-]{8,128}$/.test(jwk.kid) || 'd' in jwk) {
+      throw new Error('WORKLOAD_JWKS_JSON accepts public Ed25519 signing keys only');
+    }
+    if (keys.has(jwk.kid)) throw new Error('WORKLOAD_JWKS_JSON contains a duplicate kid');
+    keys.set(jwk.kid, createPublicKey({ key: jwk as JsonWebKey, format: 'jwk' }));
+  }
+  return { keys, issuer, audience, maxTtlSeconds };
+}
+
+export function verifyWorkloadToken(
+  token: string, verifier: WorkloadTokenVerifier, nowSeconds: number,
+): { sub: string; service: string; jti: string } {
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('malformed token');
+  const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')) as Record<string, unknown>;
+  const key = typeof header.kid === 'string' ? verifier.keys.get(header.kid) : null;
+  if (header.alg !== 'EdDSA' || header.typ !== 'JWT' || !key) throw new Error('unexpected token header');
+  if (!verify(null, Buffer.from(`${parts[0]}.${parts[1]}`), key, Buffer.from(parts[2], 'base64url'))) {
+    throw new Error('bad signature');
+  }
+  const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as Record<string, unknown>;
+  const exp = payload.exp;
+  const iat = payload.iat;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  if (payload.iss !== verifier.issuer || payload.aud !== verifier.audience || !Number.isInteger(exp) ||
+    !Number.isInteger(iat) || (payload.nbf !== undefined && !Number.isInteger(payload.nbf)) ||
+    (exp as number) <= nowSeconds || (iat as number) > nowSeconds + 30 ||
+    (exp as number) - (iat as number) <= 0 || (exp as number) - (iat as number) > verifier.maxTtlSeconds ||
+    (typeof payload.nbf === 'number' && payload.nbf > nowSeconds + 30) ||
+    typeof payload.sub !== 'string' || !uuid.test(payload.sub) ||
+    typeof payload.service !== 'string' || !/^[a-z][a-z0-9-]{1,62}$/.test(payload.service) ||
+    typeof payload.jti !== 'string' || !uuid.test(payload.jti)) {
+    throw new Error('invalid workload claims');
+  }
+  return { sub: payload.sub, service: payload.service, jti: payload.jti };
 }

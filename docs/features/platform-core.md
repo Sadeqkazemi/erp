@@ -9,9 +9,10 @@
 - [x] CSRF rejection — `test/platform-core.e2e-spec.ts` missing CSRF
 - [x] Upstream timeout does not take down core health — `test/platform-core.e2e-spec.ts` probe
 - [x] Session rotation invalidates the old cookie — `test/platform-core.e2e-spec.ts` rotates the session
+- [x] Users can inspect and revoke only their own opaque sessions; current-session revocation clears cookies. Platform admins can atomically disable another staff account and revoke all its sessions, but cannot disable themselves or customer/agency identities (`identity-lifecycle.e2e-spec.ts`).
 - [x] Optional consent defaults off and withdrawal wins — `test/platform-core.e2e-spec.ts` records consent withdrawal
 - [x] Illegal workflow transition is rejected — `src/modules/workflow/workflow-transitions.spec.ts` and e2e
-- [x] Outbox dispatch is idempotent by event id — `test/platform-core.e2e-spec.ts` deduplicates the outbox
+- [x] Outbox dispatch uses an idempotency key per event — `test/platform-core.e2e-spec.ts` checks accepted events
 
 ## Hardening (review findings)
 
@@ -23,17 +24,29 @@
 - [x] Logout and rotation require an allowed Origin; logout clears cookies with the same attributes (Secure for `__Host-`) — e2e `requires an allowed Origin`
 - [x] Login CSRF, workload password login and TOTP replay are rejected — e2e `rejects login CSRF`
 - [x] Panel tokens are Ed25519, published via JWKS, and die with their session — e2e `signs panel tokens`, `src/common/crypto.spec.ts`
+- [x] Gateway decisions recheck active staff, panel and entitlement; admin can revoke an entitlement with an audit/outbox event, immediately denying previously issued tokens — `gateway-revocation.spec.ts`
+- [x] The data-plane forward endpoint now binds a request to a registered route ID, exact method and concrete versioned path; rechecks session/principal/panel/entitlement, applies a production host allowlist and route timeout, rejects redirects/encoded slashes/oversized payloads, strips cookies and unapproved headers, and preserves only safe response headers. Domain object authorization remains with the owning service (`platform-core.e2e-spec.ts`).
 - [x] Audit log is append-only in the database — e2e `keeps the audit log append-only`
-- [x] Parallel outbox dispatchers never double-deliver — e2e `never dispatches the same outbox row twice`
+- [x] Audit read supports bounded page size, stable UTC timestamp/ID cursor, action/correlation/time filters and admin-only access — `audit-query.e2e-spec.ts`
+- [x] Parallel outbox dispatchers do not concurrently claim the same row — e2e `never dispatches the same outbox row twice`
+- [x] The publisher retains unacknowledged rows on broker errors and retries after recovery — e2e `keeps unacknowledged events pending`
+- [x] Bounded retry and durable dead-letter state after eight failures, admin-only inspection and audited replay with the same event ID — `outbox-recovery.e2e-spec.ts`
+- [x] Admin-only control-plane summary reports real panel/workflow/audit/outbox counts; domain sales is explicitly unconfigured until its owning API exists.
+- [x] Admin-only paged service catalog derives active panel owners and route counts from the registry. Bounded manual probes persist append-only status/HTTP/latency evidence; HTTP errors are failures and catalog health becomes stale after five minutes (`service-catalog.spec.ts`, `service-observations.e2e-spec.ts`). This is explicit manual evidence, not continuous production telemetry.
+- [x] Each active registered service can publish an append-only, optimistic-concurrency-protected operational profile with accountable team/on-call alias, HTTPS runbook and its own availability, p95 latency, RTO and RPO targets. Catalog output is explicitly `UNCONFIGURED` until a profile exists; no universal target is invented (`service-catalog.spec.ts`, `service-observations.e2e-spec.ts`, migration 0008).
+- [x] Versioned workflow definition registry stores owner, allowed steps and their deadlines. Production refuses unregistered runs, wrong owners and unapproved steps/timeouts; existing nonproduction tests can still create legacy ad hoc runs. Registration is immutable and audited (`workflow-definitions.spec.ts`). Domain callbacks and compensation remain separate work.
 - [x] Migrations run only with the migration role; CI tests as the least-privilege runtime role — `.github/workflows/ci.yml`
 - [x] NestJS 11 (Express 5); `npm audit` reports no advisories and CI fails on any high or critical finding — `.github/workflows/ci.yml`
+- [x] Process liveness is separated from database/migration readiness, and pinned CodeQL v4 `security-extended` analysis runs for pull requests, main and a weekly schedule (`health.controller.ts`, `.github/workflows/codeql.yml`).
+- [x] Isolated CI build produces a downloadable build archive, SHA-256 digest and CycloneDX SBOM from the lockfile; signing, provenance attestation and UAT promotion still require release infrastructure — `.github/workflows/build-evidence.yml`.
 
 ## Open items (not done in this change)
 
-- Tenant / agency scoping of principals, panels and audit (rules §7). Needs an agreed tenant model.
+- [x] Agency identity lookup uses explicit tenant UUID; audit records carry tenant ID, and unmapped legacy agency identities cannot log in (`agency-scope.spec.ts`). Still required: authoritative agency registry/backfill, tenant-scoped panel entitlements, gateway/domain object policy and cross-agency end-to-end denial tests.
 - SSO (OIDC) with phishing-resistant MFA for staff instead of local password + TOTP (diagram 49).
-- Real broker for the outbox, dead-letter queue and lag alerts; the dispatcher currently publishes in-process.
-- Workflow engine: persisted steps, compensations and timers beyond the status state machine.
-- Anonymous consent for visitors before login (rules §9); consent currently requires a session.
-- SAST, SBOM, signed image and artifact attestation in CI (rules §6).
+- Provision a durable HTTP broker ingress and external outbox lag/dead-letter alerts. Configure `OUTBOX_PUBLISH_URL` and `OUTBOX_PUBLISH_TOKEN` before production startup. The ingress MUST acknowledge only after durable broker acceptance, and deduplicate on `eventId`; otherwise a 2xx response can lose an event. Retries are at-least-once.
+- Connect the published per-service operational targets to continuous metrics, external alert routing and measured recovery drills. A stored profile is configuration evidence, not proof that its SLO/RTO/RPO has been achieved.
+- [x] Workflow step status and deadlines persist; due-step scanner marks failures, moves runs into failure/compensation, and blocks premature completion (`workflow-steps.e2e-spec.ts`). Versioned definitions now gate production runs and steps. Remaining: authenticated domain callbacks, actual compensation commands/evidence, retries, and end-to-end domain reconciliation.
+- [x] Anonymous visitor consent API before login; origin-checked POST, HttpOnly opaque cookie, stored hash, default denial and withdrawal (`visitor-consent.spec.ts`). Website integration must gate optional scripts, surface policy versions, and define retention before rollout.
+- Signed image and artifact provenance attestation in CI, plus controlled UAT/Production promotion (rules §6). CodeQL SAST is now configured; repository security settings must accept its uploaded results.
 - Management panel UI (bilingual, four theme/locale combinations); API error messages are Persian only and clients should localise by `error.code`.

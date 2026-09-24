@@ -1,5 +1,17 @@
-import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
-import { DataSource, EntityManager, In } from 'typeorm';
+import {
+  BadGatewayException,
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  GatewayTimeoutException,
+  Inject,
+  Injectable,
+  NotFoundException,
+  PayloadTooLargeException,
+  ServiceUnavailableException,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { DataSource, EntityManager, In, IsNull, LessThanOrEqual, Not } from 'typeorm';
 import { randomUUID } from 'crypto';
 import * as argon2 from 'argon2';
 import { ErrorCode } from '../common/errors';
@@ -16,6 +28,7 @@ import {
   signPanelToken,
   totpCode,
   verifyPanelToken,
+  verifyWorkloadToken,
   verifyTotp,
 } from '../common/crypto';
 import { CORE_ENV, CoreEnv } from '../config/env';
@@ -28,24 +41,42 @@ import {
   PanelEntity,
   PrincipalEntity,
   RouteContractEntity,
+  ServiceObservationEntity,
+  ServiceOperationalProfileEntity,
   SessionEntity,
   WorkflowRunEntity,
+  WorkflowDefinitionEntity,
+  WorkflowDefinitionStep,
+  WorkflowStepEntity,
+  WorkflowStepCallbackEntity,
+  VisitorConsentEntity,
 } from '../database/entities';
 import { assertWorkflowTransition, WorkflowStatus } from './workflow/workflow-transitions';
+import { assertStepTransition, StepStatus } from './workflow/step-transitions';
+import { nextOutboxRetryAt } from './outbox/retry-policy';
 
 export interface AuthenticatedPrincipal {
   id: string;
   realm: PrincipalEntity['realm'];
   username: string;
   role: PrincipalEntity['role'];
+  tenantId: string | null;
   sessionId: string;
   csrfToken: string;
 }
 
+export interface AuthenticatedWorkload {
+  id: string;
+  service: string;
+  tokenId: string;
+}
+
 const ARGON2_OPTIONS = { memoryCost: 19_456, timeCost: 2, parallelism: 1 } as const;
 const ROUTE_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
-const REALMS: PrincipalEntity['realm'][] = ['STAFF', 'CUSTOMER', 'AGENCY', 'WORKLOAD'];
+const GATEWAY_REALMS: PrincipalEntity['realm'][] = ['STAFF', 'AGENCY'];
 const OUTBOX_BATCH = 100;
+const FORWARDED_REQUEST_HEADERS = ['accept', 'content-type', 'idempotency-key', 'if-match', 'if-none-match'] as const;
+const FORWARDED_RESPONSE_HEADERS = ['cache-control', 'content-type', 'etag', 'last-modified', 'retry-after'] as const;
 
 export interface RouteInput {
   method: string;
@@ -55,6 +86,7 @@ export interface RouteInput {
   timeoutMs: number;
   allowedRealms: string[];
   version: string;
+  tenantPathParam?: string;
 }
 
 export interface PublishedEvent {
@@ -64,9 +96,45 @@ export interface PublishedEvent {
   payload: Record<string, string>;
 }
 
+export interface AuditFilters {
+  limit?: number;
+  cursor?: string;
+  action?: string;
+  correlationId?: string;
+  from?: string;
+  to?: string;
+}
+
+export interface ServiceOperationalProfileInput {
+  expectedCurrentVersion: number;
+  ownerTeam: string;
+  onCallRoute: string;
+  runbookUrl: string;
+  availabilityTargetBps: number;
+  latencyP95TargetMs: number;
+  rtoMinutes: number;
+  rpoMinutes: number;
+}
+
+export interface GatewayForwardInput {
+  method: string;
+  path: string;
+  query: string;
+  body: unknown;
+  headers: Record<string, string | string[] | undefined>;
+  correlationId: string;
+}
+
+export interface GatewayForwardResult {
+  status: number;
+  headers: Record<string, string>;
+  body: Buffer;
+}
+
 @Injectable()
 export class PlatformCoreService {
-  private readonly published: PublishedEvent[] = [];
+  // Observability snapshot for tests; broker acceptance, not this list, determines delivery.
+  private readonly acceptedEvents: PublishedEvent[] = [];
   private dummyPasswordHash: Promise<string> | null = null;
 
   constructor(
@@ -92,7 +160,20 @@ export class PlatformCoreService {
     password: string;
     role: PrincipalEntity['role'];
     totpSecret?: string;
+    tenantId?: string;
   }): Promise<{ id: string; totpSecret: string | null }> {
+    if (input.realm === 'WORKLOAD') {
+      throw new BadRequestException({
+        code: ErrorCode.VALIDATION,
+        message: 'هویت کاری فقط از مسیر ثبت سرویس و بدون رمز عبور ساخته می‌شود.',
+      });
+    }
+    if ((input.realm === 'AGENCY' && !input.tenantId) || (input.realm !== 'AGENCY' && input.tenantId)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'شناسه آژانس برای هویت آژانس الزامی است.' });
+    }
+    if (input.tenantId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.tenantId)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'شناسه آژانس نامعتبر است.' });
+    }
     if (input.realm !== 'STAFF' && input.role === 'PLATFORM_ADMIN') {
       throw new ForbiddenException({
         code: ErrorCode.REALM_REJECTED,
@@ -104,6 +185,7 @@ export class PlatformCoreService {
       id: randomUUID(),
       realm: input.realm,
       username: input.username,
+      tenantId: input.tenantId ?? null,
       passwordHash: await argon2.hash(input.password, ARGON2_OPTIONS),
       mfaSecretCiphertext: totpSecret ? encryptSecret(totpSecret, this.env.mfaEncryptionKey) : null,
       role: input.role,
@@ -122,6 +204,7 @@ export class PlatformCoreService {
     username: string;
     password: string;
     totp?: string;
+    tenantId?: string;
   }): Promise<{ principal: AuthenticatedPrincipal; sessionToken: string; csrfToken: string }> {
     if (input.realm === 'WORKLOAD') {
       throw new ForbiddenException({
@@ -129,12 +212,18 @@ export class PlatformCoreService {
         message: 'هویت سرویس با رمز عبور وارد نمی‌شود؛ از هویت کاری کوتاه‌عمر استفاده کنید.',
       });
     }
-    const principal = await this.dataSource.getRepository(PrincipalEntity).findOne({
-      where: { realm: input.realm, username: input.username, status: 'ACTIVE' },
-    });
     const invalid = new UnauthorizedException({
       code: ErrorCode.INVALID_CREDENTIALS,
       message: 'نام کاربری یا رمز عبور نادرست است.',
+    });
+    if ((input.realm === 'AGENCY' && !input.tenantId) || (input.realm !== 'AGENCY' && input.tenantId)) {
+      throw invalid;
+    }
+    const principal = await this.dataSource.getRepository(PrincipalEntity).findOne({
+      where: {
+        realm: input.realm, username: input.username, status: 'ACTIVE',
+        ...(input.realm === 'AGENCY' ? { tenantId: input.tenantId } : {}),
+      },
     });
     // Verify against a dummy hash for unknown users so response time does not reveal which usernames exist.
     const passwordOk = await argon2.verify(principal?.passwordHash ?? (await this.dummyHash()), input.password);
@@ -197,6 +286,7 @@ export class PlatformCoreService {
       realm: principal.realm,
       username: principal.username,
       role: principal.role,
+      tenantId: principal.tenantId,
       sessionId: session.id,
       csrfToken: '',
     };
@@ -266,6 +356,125 @@ export class PlatformCoreService {
     });
   }
 
+  async listOwnSessions(actor: AuthenticatedPrincipal): Promise<Array<{
+    id: string; current: boolean; createdAt: string; expiresAt: string; revokedAt: string | null; active: boolean;
+  }>> {
+    const sessions = await this.dataSource.getRepository(SessionEntity).find({
+      where: { principalId: actor.id }, order: { createdAt: 'DESC' }, take: 100,
+    });
+    const now = Date.now();
+    return sessions.map((session) => ({
+      id: session.id,
+      current: session.id === actor.sessionId,
+      createdAt: session.createdAt.toISOString(),
+      expiresAt: session.expiresAt.toISOString(),
+      revokedAt: session.revokedAt?.toISOString() ?? null,
+      active: !session.revokedAt && session.expiresAt.getTime() > now,
+    }));
+  }
+
+  async revokeOwnSession(
+    actor: AuthenticatedPrincipal, sessionId: string, correlationId: string,
+  ): Promise<{ id: string; current: boolean; revoked: boolean }> {
+    return this.dataSource.transaction(async (manager) => {
+      const session = await manager.findOne(SessionEntity, {
+        where: { id: sessionId, principalId: actor.id }, lock: { mode: 'pessimistic_write' },
+      });
+      if (!session) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'نشست یافت نشد.' });
+      const newlyRevoked = !session.revokedAt;
+      if (newlyRevoked) {
+        session.revokedAt = new Date();
+        await manager.save(session);
+        await this.appendControl(manager, {
+          actorId: actor.id, action: 'session.revoked', objectType: 'session', objectId: session.id,
+          correlationId, eventName: 'identity.session.revoked.v1', payload: { sessionId: session.id },
+        });
+      }
+      return { id: session.id, current: session.id === actor.sessionId, revoked: newlyRevoked };
+    });
+  }
+
+  async disableStaffPrincipal(
+    actor: AuthenticatedPrincipal, principalId: string, correlationId: string,
+  ): Promise<{ id: string; status: 'DISABLED'; revokedSessions: number }> {
+    this.requirePlatformAdmin(actor);
+    if (actor.id === principalId) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'مدیر نمی‌تواند حساب فعال خودش را غیرفعال کند.' });
+    }
+    return this.dataSource.transaction(async (manager) => {
+      const principal = await manager.findOne(PrincipalEntity, {
+        where: { id: principalId }, lock: { mode: 'pessimistic_write' },
+      });
+      if (!principal) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'هویت یافت نشد.' });
+      if (principal.realm !== 'STAFF') {
+        throw new ForbiddenException({ code: ErrorCode.REALM_REJECTED, message: 'مدیریت هویت مشتری و آژانس در سرویس مالک آن انجام می‌شود.' });
+      }
+      const stateChanged = principal.status !== 'DISABLED';
+      if (stateChanged) {
+        principal.status = 'DISABLED';
+        await manager.save(principal);
+      }
+      const revoked = await manager.update(SessionEntity, { principalId: principal.id, revokedAt: IsNull() }, { revokedAt: new Date() });
+      if (stateChanged || (revoked.affected ?? 0) > 0) {
+        await this.appendControl(manager, {
+          actorId: actor.id, action: 'staff.disabled', objectType: 'principal', objectId: principal.id,
+          correlationId, eventName: 'identity.staff.disabled.v1',
+          payload: { principalId: principal.id, status: principal.status },
+        });
+      }
+      return { id: principal.id, status: 'DISABLED', revokedSessions: revoked.affected ?? 0 };
+    });
+  }
+
+  async registerWorkloadPrincipal(
+    actor: AuthenticatedPrincipal, service: string, idempotencyKey: string, correlationId: string,
+  ) {
+    this.requirePlatformAdmin(actor);
+    if (!/^[a-z][a-z0-9-]{1,62}$/.test(service)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'شناسه سرویس نامعتبر است.' });
+    }
+    return this.dataSource.transaction(async (manager) =>
+      this.idempotent(manager, actor.id, 'workload.register', idempotencyKey, { service }, async () => {
+        const panel = await manager.findOne(PanelEntity, { where: { ownerService: service, status: 'ACTIVE' } });
+        if (!panel) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'سرویس فعال در رجیستری یافت نشد.' });
+        const existing = await manager.findOne(PrincipalEntity, { where: { realm: 'WORKLOAD', username: service } });
+        if (existing) throw new ConflictException({ code: ErrorCode.CONFLICT, message: 'هویت کاری سرویس قبلاً ثبت شده است.' });
+        const principal = await manager.save(PrincipalEntity, {
+          id: randomUUID(), realm: 'WORKLOAD', username: service, tenantId: null,
+          passwordHash: 'WORKLOAD_IDENTITY_ONLY', mfaSecretCiphertext: null,
+          role: 'MEMBER', status: 'ACTIVE', lastTotpStep: null,
+        });
+        await this.appendControl(manager, {
+          actorId: actor.id, action: 'workload.registered', objectType: 'principal', objectId: principal.id,
+          correlationId, eventName: 'identity.workload.registered.v1',
+          payload: { principalId: principal.id, service },
+        });
+        return { id: principal.id, service, status: principal.status };
+      }),
+    );
+  }
+
+  async authenticateWorkload(authorization: string | undefined): Promise<AuthenticatedWorkload> {
+    if (!this.env.workloadTokenVerifier) {
+      throw new ServiceUnavailableException({
+        code: ErrorCode.IDENTITY_UNAVAILABLE, message: 'اعتبارسنج هویت کاری پیکربندی نشده است.',
+      });
+    }
+    let claims: { sub: string; service: string; jti: string };
+    try {
+      claims = verifyWorkloadToken(
+        this.readBearer(authorization), this.env.workloadTokenVerifier, Math.floor(Date.now() / 1000),
+      );
+    } catch {
+      throw new UnauthorizedException({ code: ErrorCode.UNAUTHENTICATED, message: 'هویت کاری معتبر نیست.' });
+    }
+    const principal = await this.dataSource.getRepository(PrincipalEntity).findOne({ where: { id: claims.sub } });
+    if (!principal || principal.realm !== 'WORKLOAD' || principal.status !== 'ACTIVE' || principal.username !== claims.service) {
+      throw new UnauthorizedException({ code: ErrorCode.UNAUTHENTICATED, message: 'هویت کاری معتبر نیست.' });
+    }
+    return { id: principal.id, service: claims.service, tokenId: claims.jti };
+  }
+
   async registerPanel(
     actor: AuthenticatedPrincipal,
     input: {
@@ -331,16 +540,23 @@ export class PlatformCoreService {
       });
     }
     const target = await this.requirePrincipal(input.principalId);
-    if (target.realm !== 'STAFF') {
+    if (target.realm !== 'STAFF' && target.realm !== 'AGENCY') {
       throw new ForbiddenException({
         code: ErrorCode.REALM_REJECTED,
-        message: 'دسترسی پنل کارکنان به هویت مشتری یا آژانس داده نمی‌شود.',
+        message: 'دسترسی پنل به هویت مشتری یا سرویس داده نمی‌شود.',
       });
     }
     return this.dataSource.transaction(async (manager) => {
       const panel = await manager.findOne(PanelEntity, { where: { code: input.panelCode, status: 'ACTIVE' } });
       if (!panel) {
         throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'پنل یافت نشد.' });
+      }
+      const expectedAudiencePrefix = target.realm === 'AGENCY' ? 'agency:' : 'panel:';
+      if (!panel.audience.startsWith(expectedAudiencePrefix)) {
+        throw new ForbiddenException({
+          code: ErrorCode.REALM_REJECTED,
+          message: 'کانال پنل با قلمرو هویت مقصد سازگار نیست.',
+        });
       }
       const existing = await manager.findOne(EntitlementEntity, { where: { principalId: target.id, panelId: panel.id } });
       if (existing) {
@@ -367,6 +583,28 @@ export class PlatformCoreService {
     });
   }
 
+  async revokeEntitlement(actor: AuthenticatedPrincipal, entitlementId: string, correlationId: string): Promise<EntitlementEntity> {
+    this.requirePlatformAdmin(actor);
+    return this.dataSource.transaction(async (manager) => {
+      const entitlement = await manager.findOne(EntitlementEntity, {
+        where: { id: entitlementId }, lock: { mode: 'pessimistic_write' },
+      });
+      if (!entitlement) {
+        throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'دسترسی پنل یافت نشد.' });
+      }
+      if (entitlement.status === 'ACTIVE') {
+        entitlement.status = 'REVOKED';
+        await manager.save(entitlement);
+        await this.appendControl(manager, {
+          actorId: actor.id, action: 'entitlement.revoked', objectType: 'entitlement',
+          objectId: entitlement.id, correlationId, eventName: 'core.entitlement.revoked.v1',
+          payload: { entitlementId: entitlement.id, principalId: entitlement.principalId, panelId: entitlement.panelId },
+        });
+      }
+      return entitlement;
+    });
+  }
+
   async issuePanelToken(actor: AuthenticatedPrincipal, panelCode: string): Promise<{ token: string; audience: string; expiresAt: string }> {
     const panel = await this.dataSource.getRepository(PanelEntity).findOne({ where: { code: panelCode, status: 'ACTIVE' } });
     if (!panel) {
@@ -375,7 +613,10 @@ export class PlatformCoreService {
     const entitlement = await this.dataSource.getRepository(EntitlementEntity).findOne({
       where: { principalId: actor.id, panelId: panel.id, status: 'ACTIVE' },
     });
-    if (!entitlement || actor.realm !== 'STAFF') {
+    const expectedAudiencePrefix = actor.realm === 'AGENCY' ? 'agency:' : 'panel:';
+    if (!entitlement || (actor.realm !== 'STAFF' && actor.realm !== 'AGENCY') ||
+      !panel.audience.startsWith(expectedAudiencePrefix) ||
+      (actor.realm === 'AGENCY' && !actor.tenantId)) {
       throw new ForbiddenException({
         code: ErrorCode.FORBIDDEN,
         message: 'به این پنل دسترسی ندارید.',
@@ -388,7 +629,9 @@ export class PlatformCoreService {
         iss: this.env.panelTokenIssuer,
         sub: actor.id,
         aud: panel.audience,
+        panelId: panel.id,
         realm: actor.realm,
+        ...(actor.tenantId ? { tenantId: actor.tenantId } : {}),
         sid: actor.sessionId,
         jti: randomUUID(),
         iat: now,
@@ -407,6 +650,10 @@ export class PlatformCoreService {
     this.requirePlatformAdmin(actor);
     const route = this.validateRoute(input);
     return this.dataSource.transaction(async (manager) => {
+      const panel = await manager.findOne(PanelEntity, { where: { audience: route.audience, status: 'ACTIVE' } });
+      if (!panel) {
+        throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'مخاطب مسیر به پنل فعال متصل نیست.' });
+      }
       const clash = await manager.findOne(RouteContractEntity, {
         where: { method: route.method, pathPattern: route.pathPattern, version: route.version },
       });
@@ -436,50 +683,24 @@ export class PlatformCoreService {
 
   async decideRoute(
     authorization: string | undefined,
-    request: { method: string; pathPattern: string; version: string },
+    request: { method: string; pathPattern: string; version: string; path?: string },
   ): Promise<{
     audience: string;
     upstreamBaseUrl: string;
     timeoutMs: number;
     version: string;
   }> {
-    const token = this.readBearer(authorization);
-    const unauthenticated = new UnauthorizedException({
-      code: ErrorCode.UNAUTHENTICATED,
-      message: 'نشست معتبر نیست.',
-    });
-    let payload: Record<string, string | number>;
-    try {
-      payload = verifyPanelToken(token, this.env.panelTokenKeys, {
-        issuer: this.env.panelTokenIssuer,
-        nowSeconds: Math.floor(Date.now() / 1000),
-      });
-    } catch {
-      throw unauthenticated;
-    }
-    // A panel token dies with the session that issued it (logout, rotation, expiry).
-    const sid = typeof payload.sid === 'string' && /^[0-9a-f-]{36}$/i.test(payload.sid) ? payload.sid : null;
-    if (!sid) {
-      throw unauthenticated;
-    }
-    const session = await this.dataSource.getRepository(SessionEntity).findOne({ where: { id: sid } });
-    if (!session || session.revokedAt || session.expiresAt.getTime() <= Date.now() || session.principalId !== payload.sub) {
-      throw unauthenticated;
-    }
+    const { payload, principal } = await this.authenticatePanelToken(authorization);
     const route = await this.dataSource.getRepository(RouteContractEntity).findOne({
       where: { method: request.method.toUpperCase(), pathPattern: request.pathPattern, version: request.version },
     });
     if (!route) {
       throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'مسیر درگاه یافت نشد.' });
     }
-    const realm = String(payload.realm ?? '');
-    const allowed = route.allowedRealms.split(',');
-    if (payload.aud !== route.audience || !allowed.includes(realm)) {
-      throw new ForbiddenException({
-        code: ErrorCode.FORBIDDEN,
-        message: 'توکن این پنل برای این مسیر پذیرفته نیست.',
-      });
+    if (request.path && !this.pathMatches(route.pathPattern, request.path)) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'مسیر واقعی با قرارداد ثبت‌شده مطابقت ندارد.' });
     }
+    await this.assertRouteAccess(payload, principal, route, request.path);
     return {
       audience: route.audience,
       upstreamBaseUrl: route.upstreamBaseUrl,
@@ -488,7 +709,96 @@ export class PlatformCoreService {
     };
   }
 
-  async probeUpstream(actor: AuthenticatedPrincipal, routeId: string): Promise<{ isolated: true }> {
+  async forwardRoute(
+    authorization: string | undefined, routeId: string, request: GatewayForwardInput,
+  ): Promise<GatewayForwardResult> {
+    const { payload, principal, token } = await this.authenticatePanelToken(authorization);
+    const route = await this.dataSource.getRepository(RouteContractEntity).findOne({ where: { id: routeId } });
+    if (!route) {
+      throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'مسیر درگاه یافت نشد.' });
+    }
+    const method = request.method.toUpperCase();
+    if (method !== route.method || !this.pathMatches(route.pathPattern, request.path)) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'درخواست با قرارداد مسیر مطابقت ندارد.' });
+    }
+    await this.assertRouteAccess(payload, principal, route, request.path);
+    const target = this.gatewayTarget(route, request.path, request.query);
+    const outgoingHeaders: Record<string, string> = {
+      authorization: `Bearer ${token}`,
+      'x-request-id': request.correlationId,
+    };
+    for (const name of FORWARDED_REQUEST_HEADERS) {
+      const value = request.headers[name];
+      if (typeof value === 'string' && value.length <= 512 && !/[\r\n]/.test(value)) {
+        outgoingHeaders[name] = value;
+      }
+    }
+    if (outgoingHeaders['idempotency-key'] && !/^[A-Za-z0-9_-]{8,128}$/.test(outgoingHeaders['idempotency-key'])) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'کلید تکرار درخواست بالادست نامعتبر است.' });
+    }
+    let body: string | undefined;
+    if (request.body !== undefined && request.body !== null) {
+      if (method === 'GET') {
+        throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'درخواست GET نباید بدنه داشته باشد.' });
+      }
+      const contentType = outgoingHeaders['content-type']?.toLowerCase() ?? 'application/json';
+      if (!(contentType.startsWith('application/json') || contentType.includes('+json'))) {
+        throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'درگاه فعلاً فقط بدنه JSON را می‌پذیرد.' });
+      }
+      body = JSON.stringify(request.body);
+      if (Buffer.byteLength(body) > this.env.gatewayMaxRequestBytes) {
+        throw new PayloadTooLargeException({ code: ErrorCode.PAYLOAD_TOO_LARGE, message: 'حجم درخواست از حد مجاز مسیر بیشتر است.' });
+      }
+      outgoingHeaders['content-type'] = contentType;
+    } else {
+      delete outgoingHeaders['content-type'];
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), route.timeoutMs);
+    let response: Response;
+    try {
+      response = await fetch(target, {
+        method,
+        headers: outgoingHeaders,
+        body,
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+    } catch {
+      clearTimeout(timer);
+      throw new GatewayTimeoutException({
+        code: ErrorCode.UPSTREAM_TIMEOUT,
+        message: 'سرویس بالادست در مهلت قرارداد پاسخ نداد.',
+      });
+    }
+    if (response.status >= 300 && response.status < 400 && response.status !== 304) {
+      clearTimeout(timer);
+      await response.body?.cancel();
+      throw new BadGatewayException({ code: ErrorCode.UPSTREAM_REJECTED, message: 'تغییر مسیر بالادست توسط درگاه پذیرفته نشد.' });
+    }
+    let responseBody: Buffer;
+    try {
+      responseBody = await this.readBoundedResponse(response, controller);
+    } catch (error) {
+      if (error instanceof BadGatewayException) throw error;
+      throw new GatewayTimeoutException({
+        code: ErrorCode.UPSTREAM_TIMEOUT,
+        message: 'خواندن پاسخ سرویس بالادست در مهلت قرارداد کامل نشد.',
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    const responseHeaders: Record<string, string> = {};
+    for (const name of FORWARDED_RESPONSE_HEADERS) {
+      const value = response.headers.get(name);
+      if (value && value.length <= 1024 && !/[\r\n]/.test(value)) responseHeaders[name] = value;
+    }
+    return { status: response.status, headers: responseHeaders, body: responseBody };
+  }
+
+  async probeUpstream(actor: AuthenticatedPrincipal, routeId: string): Promise<{
+    isolated: true; status: 'UP'; latencyMs: number; observedAt: string;
+  }> {
     this.requirePlatformAdmin(actor);
     const route = await this.dataSource.getRepository(RouteContractEntity).findOne({ where: { id: routeId } });
     if (!route) {
@@ -496,11 +806,12 @@ export class PlatformCoreService {
     }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), route.timeoutMs);
+    const startedAt = Date.now();
+    let response: Response;
     try {
-      const response = await fetch(route.upstreamBaseUrl, { method: 'GET', redirect: 'manual', signal: controller.signal });
-      await response.body?.cancel();
-      return { isolated: true };
+      response = await fetch(route.upstreamBaseUrl, { method: 'GET', redirect: 'manual', signal: controller.signal });
     } catch {
+      await this.recordServiceObservation(route.id, 'DOWN', Date.now() - startedAt, null, 'FETCH_FAILED');
       throw new ConflictException({
         code: ErrorCode.UPSTREAM_TIMEOUT,
         message: 'سرویس بالادست در مهلت مقرر پاسخ نداد. هسته در دسترس ماند.',
@@ -508,6 +819,13 @@ export class PlatformCoreService {
     } finally {
       clearTimeout(timer);
     }
+    await response.body?.cancel();
+    if (!response.ok) {
+      await this.recordServiceObservation(route.id, 'DOWN', Date.now() - startedAt, response.status, `HTTP_${response.status}`);
+      throw new ConflictException({ code: ErrorCode.CONFLICT, message: 'سرویس بالادست پاسخ سالم نداد.' });
+    }
+    const observation = await this.recordServiceObservation(route.id, 'UP', Date.now() - startedAt, response.status, null);
+    return { isolated: true, status: 'UP', latencyMs: observation.latencyMs, observedAt: observation.observedAt.toISOString() };
   }
 
   async startWorkflow(
@@ -518,6 +836,13 @@ export class PlatformCoreService {
     this.requireStaff(actor);
     return this.dataSource.transaction(async (manager) =>
       this.idempotent(manager, actor.id, 'workflow.start', idempotencyKey, input, async () => {
+        const definition = await manager.findOne(WorkflowDefinitionEntity, { where: { definitionKey: input.definitionKey } });
+        if (!definition && this.env.workflowDefinitionsRequired) {
+          throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'تعریف گردش‌کار ثبت نشده است.' });
+        }
+        if (definition && definition.ownerService !== input.ownerService) {
+          throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'مالک گردش‌کار با تعریف ثبت‌شده مطابقت ندارد.' });
+        }
         const run = manager.create(WorkflowRunEntity, {
           id: randomUUID(),
           definitionKey: input.definitionKey,
@@ -544,6 +869,32 @@ export class PlatformCoreService {
     );
   }
 
+  async registerWorkflowDefinition(
+    actor: AuthenticatedPrincipal,
+    input: { definitionKey: string; ownerService: string; steps: WorkflowDefinitionStep[] },
+    correlationId: string,
+  ): Promise<WorkflowDefinitionEntity> {
+    this.requirePlatformAdmin(actor);
+    const keys = input.steps.map((step) => step.stepKey);
+    if (new Set(keys).size !== keys.length) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'کلید گام تکراری است.' });
+    }
+    return this.dataSource.transaction(async (manager) => {
+      await manager.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`workflow.definition|${input.definitionKey}`]);
+      const existing = await manager.findOne(WorkflowDefinitionEntity, { where: { definitionKey: input.definitionKey } });
+      if (existing) throw new ConflictException({ code: ErrorCode.CONFLICT, message: 'نسخهٔ تعریف از قبل ثبت شده است.' });
+      const definition = await manager.save(manager.create(WorkflowDefinitionEntity, {
+        id: randomUUID(), definitionKey: input.definitionKey, ownerService: input.ownerService, steps: input.steps,
+      }));
+      await this.appendControl(manager, {
+        actorId: actor.id, action: 'workflow.definition.registered', objectType: 'workflow_definition',
+        objectId: definition.id, correlationId, eventName: 'core.workflow.definition.registered.v1',
+        payload: { definitionId: definition.id, definitionKey: definition.definitionKey, ownerService: definition.ownerService },
+      });
+      return definition;
+    });
+  }
+
   async transitionWorkflow(actor: AuthenticatedPrincipal, id: string, to: WorkflowStatus, correlationId: string): Promise<WorkflowRunEntity> {
     this.requireStaff(actor);
     return this.dataSource.transaction(async (manager) => {
@@ -552,12 +903,7 @@ export class PlatformCoreService {
       if (!run) {
         throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'اجرای گردش‌کار یافت نشد.' });
       }
-      if (run.startedByPrincipalId !== actor.id && actor.role !== 'PLATFORM_ADMIN') {
-        throw new ForbiddenException({
-          code: ErrorCode.FORBIDDEN,
-          message: 'فقط آغازکننده یا مدیر سکو می‌تواند وضعیت این گردش‌کار را تغییر دهد.',
-        });
-      }
+      this.assertWorkflowActor(actor, run);
       try {
         assertWorkflowTransition(run.status, to);
       } catch {
@@ -565,6 +911,21 @@ export class PlatformCoreService {
           code: ErrorCode.ILLEGAL_TRANSITION,
           message: 'این تغییر وضعیت گردش‌کار مجاز نیست.',
         });
+      }
+      if (to === 'COMPLETED' || to === 'COMPENSATED') {
+        const steps = await manager.find(WorkflowStepEntity, { where: { workflowRunId: run.id } });
+        const done = to === 'COMPLETED'
+          ? steps.every((step) => step.status === 'SUCCEEDED')
+          : steps.every((step) => step.status === 'COMPENSATED' || step.status === 'FAILED');
+        if (!done) {
+          throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'گام‌های گردش‌کار هنوز نهایی نشده‌اند.' });
+        }
+      }
+      if (to === 'FAILED') {
+        const successful = await manager.findOne(WorkflowStepEntity, { where: { workflowRunId: run.id, status: 'SUCCEEDED' } });
+        if (successful) {
+          throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'گام‌های موفق باید ابتدا جبران شوند.' });
+        }
       }
       const from = run.status;
       run.status = to;
@@ -581,6 +942,177 @@ export class PlatformCoreService {
       });
       return run;
     });
+  }
+
+  async createWorkflowStep(
+    actor: AuthenticatedPrincipal, workflowRunId: string,
+    input: { stepKey: string; timeoutSeconds: number }, idempotencyKey: string, correlationId: string,
+  ): Promise<{ id: string; stepKey: string; status: StepStatus; deadlineAt: string }> {
+    this.requireStaff(actor);
+    return this.dataSource.transaction(async (manager) => {
+      const run = await manager.findOne(WorkflowRunEntity, { where: { id: workflowRunId }, lock: { mode: 'pessimistic_write' } });
+      if (!run) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'اجرای گردش‌کار یافت نشد.' });
+      this.assertWorkflowActor(actor, run);
+      if (run.status !== 'RUNNING' && run.status !== 'WAITING') {
+        throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'اجرای گردش‌کار آماده ثبت گام نیست.' });
+      }
+      const definition = await manager.findOne(WorkflowDefinitionEntity, { where: { definitionKey: run.definitionKey } });
+      if (!definition && this.env.workflowDefinitionsRequired) {
+        throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'تعریف گردش‌کار ثبت نشده است.' });
+      }
+      if (definition && !definition.steps.some((step) => step.stepKey === input.stepKey && step.timeoutSeconds === input.timeoutSeconds)) {
+        throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'گام یا مهلت آن در تعریف ثبت‌شده نیست.' });
+      }
+      return this.idempotent(manager, actor.id, `workflow.step.${workflowRunId}`, idempotencyKey, input, async () => {
+        const existing = await manager.findOne(WorkflowStepEntity, { where: { workflowRunId, stepKey: input.stepKey } });
+        if (existing) throw new ConflictException({ code: ErrorCode.CONFLICT, message: 'این گام قبلاً ثبت شده است.' });
+        const step = manager.create(WorkflowStepEntity, {
+          id: randomUUID(), workflowRunId, stepKey: input.stepKey, status: 'PENDING' as const,
+          attempt: 0, deadlineAt: new Date(Date.now() + input.timeoutSeconds * 1000),
+        });
+        await manager.save(step);
+        await this.appendControl(manager, {
+          actorId: actor.id, action: 'workflow.step.created', objectType: 'workflow_step', objectId: step.id,
+          correlationId, eventName: 'core.workflow.step.created.v1',
+          payload: { workflowRunId, stepId: step.id, stepKey: step.stepKey },
+        });
+        return { id: step.id, stepKey: step.stepKey, status: step.status, deadlineAt: step.deadlineAt.toISOString() };
+      });
+    });
+  }
+
+  async transitionWorkflowStep(
+    actor: AuthenticatedPrincipal, workflowRunId: string, stepKey: string, to: StepStatus, correlationId: string,
+  ): Promise<WorkflowStepEntity> {
+    this.requireStaff(actor);
+    return this.dataSource.transaction(async (manager) => {
+      const run = await manager.findOne(WorkflowRunEntity, { where: { id: workflowRunId }, lock: { mode: 'pessimistic_write' } });
+      if (!run) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'اجرای گردش‌کار یافت نشد.' });
+      this.assertWorkflowActor(actor, run);
+      const step = await manager.findOne(WorkflowStepEntity, {
+        where: { workflowRunId, stepKey }, lock: { mode: 'pessimistic_write' },
+      });
+      if (!step) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'گام گردش‌کار یافت نشد.' });
+      try {
+        assertStepTransition(step.status, to);
+      } catch {
+        throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'تغییر وضعیت گام مجاز نیست.' });
+      }
+      if (['PENDING', 'RUNNING'].includes(step.status) && step.deadlineAt.getTime() <= Date.now()) {
+        throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'مهلت گام به پایان رسیده است.' });
+      }
+      if ((to === 'COMPENSATING' || to === 'COMPENSATED') && run.status !== 'COMPENSATING') {
+        throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'اجرای گردش‌کار در وضعیت جبران نیست.' });
+      }
+      if (to !== 'COMPENSATING' && to !== 'COMPENSATED' && run.status !== 'RUNNING' && run.status !== 'WAITING') {
+        throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'اجرای گردش‌کار فعال نیست.' });
+      }
+      const from = step.status;
+      step.status = to;
+      step.attempt += 1;
+      await manager.save(step);
+      await this.appendControl(manager, {
+        actorId: actor.id, action: 'workflow.step.transitioned', objectType: 'workflow_step', objectId: step.id,
+        correlationId, eventName: 'core.workflow.step.transitioned.v1',
+        payload: { workflowRunId, stepId: step.id, from, status: to },
+      });
+      return step;
+    });
+  }
+
+  async recordWorkflowStepCallback(
+    workload: AuthenticatedWorkload, workflowRunId: string, stepKey: string,
+    input: { result: 'SUCCEEDED' | 'FAILED' | 'COMPENSATED'; evidenceId: string; occurredAt: string },
+    idempotencyKey: string, correlationId: string,
+  ) {
+    if (!/^[a-z][a-z0-9-]{1,62}$/.test(stepKey) || !/^[A-Za-z0-9._:/-]{8,160}$/.test(input.evidenceId)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'کلید گام یا شناسه مدرک نامعتبر است.' });
+    }
+    const occurredAt = new Date(input.occurredAt);
+    if (Number.isNaN(occurredAt.getTime()) || occurredAt.getTime() > Date.now() + 300_000) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'زمان رخداد مدرک نامعتبر است.' });
+    }
+    return this.dataSource.transaction(async (manager) =>
+      this.idempotent(manager, workload.id, `workflow.callback.${workflowRunId}.${stepKey}`, idempotencyKey, input, async () => {
+        const run = await manager.findOne(WorkflowRunEntity, {
+          where: { id: workflowRunId }, lock: { mode: 'pessimistic_write' },
+        });
+        if (!run) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'اجرای گردش‌کار یافت نشد.' });
+        if (run.ownerService !== workload.service) {
+          throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'هویت کاری مالک این گردش‌کار نیست.' });
+        }
+        const step = await manager.findOne(WorkflowStepEntity, {
+          where: { workflowRunId, stepKey }, lock: { mode: 'pessimistic_write' },
+        });
+        if (!step) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'گام گردش‌کار یافت نشد.' });
+        try {
+          assertStepTransition(step.status, input.result);
+        } catch {
+          throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'نتیجه Callback با وضعیت گام سازگار نیست.' });
+        }
+        if (input.result === 'COMPENSATED' && run.status !== 'COMPENSATING') {
+          throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'گردش‌کار در وضعیت جبران نیست.' });
+        }
+        if (input.result !== 'COMPENSATED' && run.status !== 'RUNNING' && run.status !== 'WAITING') {
+          throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'گردش‌کار فعال نیست.' });
+        }
+        const callback = await manager.save(WorkflowStepCallbackEntity, {
+          id: randomUUID(), workflowRunId, workflowStepId: step.id, reportedByPrincipalId: workload.id,
+          result: input.result, evidenceId: input.evidenceId, occurredAt, idempotencyKey,
+        });
+        const from = step.status;
+        step.status = input.result;
+        step.attempt += 1;
+        await manager.save(step);
+        await this.appendControl(manager, {
+          actorId: workload.id, action: 'workflow.step.callback_recorded', objectType: 'workflow_step_callback',
+          objectId: callback.id, correlationId, eventName: 'core.workflow.step.callback-recorded.v1',
+          payload: { workflowRunId, stepId: step.id, callbackId: callback.id, from, status: step.status, evidenceId: input.evidenceId },
+        });
+        return { callbackId: callback.id, workflowRunId, stepKey, status: step.status, evidenceId: input.evidenceId };
+      }),
+    );
+  }
+
+  async expireWorkflowSteps(): Promise<number> {
+    const candidates = await this.dataSource.getRepository(WorkflowStepEntity).find({
+      where: { status: In(['PENDING', 'RUNNING']), deadlineAt: LessThanOrEqual(new Date()) },
+      order: { deadlineAt: 'ASC' }, take: 50,
+    });
+    let count = 0;
+    for (const candidate of candidates) {
+      const expired = await this.dataSource.transaction(async (manager) => {
+        // Always lock the run before the step, matching manual transition lock order.
+        const run = await manager.findOne(WorkflowRunEntity, {
+          where: { id: candidate.workflowRunId }, lock: { mode: 'pessimistic_write' },
+        });
+        if (!run) return false;
+        const step = await manager.findOne(WorkflowStepEntity, { where: { id: candidate.id }, lock: { mode: 'pessimistic_write' } });
+        if (!step || !['PENDING', 'RUNNING'].includes(step.status) || step.deadlineAt.getTime() > Date.now()) return false;
+        step.status = 'FAILED';
+        step.attempt += 1;
+        await manager.save(step);
+        if (run.status === 'RUNNING' || run.status === 'WAITING') {
+          const success = await manager.findOne(WorkflowStepEntity, { where: { workflowRunId: run.id, status: 'SUCCEEDED' } });
+          run.status = success ? 'COMPENSATING' : 'FAILED';
+          await manager.save(run);
+        }
+        await this.appendControl(manager, {
+          actorId: null, action: 'workflow.step.expired', objectType: 'workflow_step', objectId: step.id,
+          correlationId: run.correlationId, eventName: 'core.workflow.step.expired.v1',
+          payload: { workflowRunId: run.id, stepId: step.id, status: 'FAILED' },
+        });
+        return true;
+      });
+      if (expired) count += 1;
+    }
+    return count;
+  }
+
+  private assertWorkflowActor(actor: AuthenticatedPrincipal, run: WorkflowRunEntity): void {
+    if (run.startedByPrincipalId !== actor.id && actor.role !== 'PLATFORM_ADMIN') {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'فقط آغازکننده یا مدیر سکو می‌تواند گردش‌کار را تغییر دهد.' });
+    }
   }
 
   async recordConsent(
@@ -622,15 +1154,275 @@ export class PlatformCoreService {
     };
   }
 
-  async listAudit(actor: AuthenticatedPrincipal): Promise<AuditEventEntity[]> {
+  async recordVisitorConsent(
+    visitorToken: string,
+    input: { purpose: 'ANALYTICS' | 'ADVERTISING'; policyVersion: string; decision: 'GRANTED' | 'WITHDRAWN' },
+    correlationId: string,
+  ): Promise<VisitorConsentEntity> {
+    if (!this.validVisitorToken(visitorToken)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'شناسه بازدیدکننده معتبر نیست.' });
+    }
+    return this.dataSource.transaction(async (manager) => {
+      const record = manager.create(VisitorConsentEntity, {
+        id: randomUUID(), visitorHash: sha256(visitorToken), ...input,
+      });
+      await manager.save(record);
+      await this.appendControl(manager, {
+        actorId: null, action: 'visitor.consent.recorded', objectType: 'visitor_consent',
+        objectId: record.id, correlationId, eventName: 'core.visitor.consent.recorded.v1',
+        payload: { consentId: record.id, purpose: input.purpose, decision: input.decision },
+      });
+      return record;
+    });
+  }
+
+  async visitorConsentSnapshot(visitorToken: string | undefined): Promise<{ analytics: boolean; advertising: boolean }> {
+    if (!visitorToken || !this.validVisitorToken(visitorToken)) {
+      return { analytics: false, advertising: false };
+    }
+    const rows = await this.dataSource.getRepository(VisitorConsentEntity).find({
+      where: { visitorHash: sha256(visitorToken) }, order: { recordedAt: 'DESC', id: 'DESC' },
+    });
+    const latest = (purpose: 'ANALYTICS' | 'ADVERTISING') => rows.find((row) => row.purpose === purpose);
+    return { analytics: latest('ANALYTICS')?.decision === 'GRANTED', advertising: latest('ADVERTISING')?.decision === 'GRANTED' };
+  }
+
+  private validVisitorToken(token: string): boolean {
+    return /^[A-Za-z0-9_-]{40,90}$/.test(token);
+  }
+
+  async listAudit(actor: AuthenticatedPrincipal, filters: AuditFilters = {}): Promise<{ rows: AuditEventEntity[]; nextCursor: string | null }> {
     this.requirePlatformAdmin(actor);
-    return this.dataSource.getRepository(AuditEventEntity).find({ order: { createdAt: 'DESC' }, take: 100 });
+    const limit = filters.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'تعداد رویدادهای درخواستی نامعتبر است.' });
+    }
+    const from = filters.from ? new Date(filters.from) : null;
+    const to = filters.to ? new Date(filters.to) : null;
+    if ((from && Number.isNaN(from.getTime())) || (to && Number.isNaN(to.getTime())) || (from && to && from > to)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'بازه زمانی ممیزی نامعتبر است.' });
+    }
+    let cursor: { createdAt: string; id: string } | null = null;
+    if (filters.cursor) {
+      try {
+        const parsed: unknown = JSON.parse(Buffer.from(filters.cursor, 'base64url').toString('utf8'));
+        const value = parsed as { createdAt?: unknown; id?: unknown };
+        if (typeof value.createdAt !== 'string' || typeof value.id !== 'string' ||
+          !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/.test(value.createdAt) ||
+          Number.isNaN(Date.parse(value.createdAt)) || !/^[0-9a-f-]{36}$/i.test(value.id)) throw new Error('invalid cursor');
+        cursor = { createdAt: value.createdAt, id: value.id };
+      } catch {
+        throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'نشانگر صفحه ممیزی نامعتبر است.' });
+      }
+    }
+    const query = this.dataSource.getRepository(AuditEventEntity).createQueryBuilder('audit');
+    if (filters.action) query.andWhere('audit.action = :action', { action: filters.action });
+    if (filters.correlationId) query.andWhere('audit.correlationId = :correlationId', { correlationId: filters.correlationId });
+    if (from) query.andWhere('audit.createdAt >= :from', { from });
+    if (to) query.andWhere('audit.createdAt <= :to', { to });
+    if (cursor) query.andWhere('(audit.createdAt < :cursorTime OR (audit.createdAt = :cursorTime AND audit.id < :cursorId))', {
+      cursorTime: cursor.createdAt, cursorId: cursor.id,
+    });
+    const found = await query
+      .addSelect("to_char(audit.createdAt AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')", 'cursorTime')
+      .orderBy('audit.createdAt', 'DESC').addOrderBy('audit.id', 'DESC').take(limit + 1).getRawAndEntities();
+    const rows = found.entities.slice(0, limit);
+    const last = rows.at(-1);
+    return {
+      rows,
+      nextCursor: found.entities.length > limit && last
+        ? Buffer.from(JSON.stringify({ createdAt: found.raw[limit - 1].cursorTime as string, id: last.id })).toString('base64url')
+        : null,
+    };
+  }
+
+  async controlPlaneSummary(actor: AuthenticatedPrincipal) {
+    this.requirePlatformAdmin(actor);
+    const [panels, routes, workflows, outbox, dailyAudit] = await Promise.all([
+      this.dataSource.query(`SELECT count(*)::int AS total,
+        count(*) FILTER (WHERE status = 'ACTIVE')::int AS active FROM panels`),
+      this.dataSource.query('SELECT count(*)::int AS total FROM route_contracts'),
+      this.dataSource.query('SELECT status, count(*)::int AS count FROM workflow_runs GROUP BY status ORDER BY status'),
+      this.dataSource.query(`SELECT
+        count(*) FILTER (WHERE "deadLetterAt" IS NULL)::int AS pending,
+        count(*) FILTER (WHERE "deadLetterAt" IS NULL AND attempts > 0)::int AS retried,
+        count(*) FILTER (WHERE "deadLetterAt" IS NOT NULL)::int AS "deadLetters",
+        extract(epoch FROM (now() - min("createdAt") FILTER (WHERE "deadLetterAt" IS NULL)))::int AS "oldestAgeSeconds",
+        extract(epoch FROM (now() - min("deadLetterAt")))::int AS "oldestDeadLetterAgeSeconds"
+        FROM outbox_events WHERE "publishedAt" IS NULL`),
+      this.dataSource.query(`SELECT to_char(date_trunc('day', "createdAt" AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
+        count(*)::int AS count FROM audit_events
+        WHERE "createdAt" >= date_trunc('day', now() AT TIME ZONE 'UTC') - interval '6 days'
+        GROUP BY day ORDER BY day`),
+    ]);
+    return {
+      asOf: new Date().toISOString(),
+      panels: panels[0], routes: routes[0], workflows,
+      outbox: outbox[0], auditLastSevenUtcDays: dailyAudit,
+      domainSales: { status: 'UNCONFIGURED' },
+    };
+  }
+
+  async listRegisteredServices(actor: AuthenticatedPrincipal, limit = 100, cursor?: string) {
+    this.requirePlatformAdmin(actor);
+    const rows = await this.dataSource.query(`WITH service_panels AS (
+        SELECT p."ownerService", count(DISTINCT p.id)::int AS "activePanels"
+        FROM panels p WHERE p.status = 'ACTIVE' AND ($1::varchar IS NULL OR p."ownerService" > $1)
+        GROUP BY p."ownerService"
+      ), service_routes AS (
+        SELECT DISTINCT p."ownerService", r.id AS "routeId"
+        FROM panels p JOIN route_contracts r ON r.audience = p.audience WHERE p.status = 'ACTIVE'
+      ), route_latest AS (
+        SELECT sr."ownerService", sr."routeId", o.status, o."latencyMs", o."observedAt"
+        FROM service_routes sr LEFT JOIN LATERAL (
+          SELECT status, "latencyMs", "observedAt" FROM service_observations
+          WHERE "routeId" = sr."routeId" ORDER BY "observedAt" DESC LIMIT 1
+        ) o ON true
+      ), service_health AS (
+        SELECT sp."ownerService", sp."activePanels", count(rl."routeId")::int AS "registeredRoutes",
+        CASE WHEN count(rl."routeId") = 0 OR count(rl."observedAt") = 0 THEN 'UNKNOWN'
+          WHEN count(*) FILTER (WHERE rl."observedAt" IS NULL OR rl."observedAt" < now() - interval '5 minutes') > 0 THEN 'STALE'
+          WHEN bool_and(rl.status = 'UP') THEN 'UP' WHEN bool_and(rl.status = 'DOWN') THEN 'DOWN' ELSE 'DEGRADED' END AS health,
+        max(rl."observedAt") AS "lastObservedAt",
+        round(avg(rl."latencyMs") FILTER (WHERE rl."observedAt" >= now() - interval '5 minutes'))::int AS "averageLatencyMs"
+      FROM service_panels sp LEFT JOIN route_latest rl ON rl."ownerService" = sp."ownerService"
+      GROUP BY sp."ownerService", sp."activePanels"
+      ), profile_latest AS (
+        SELECT DISTINCT ON ("ownerService") "ownerService", version, "ownerTeam", "onCallRoute", "runbookUrl",
+          "availabilityTargetBps", "latencyP95TargetMs", "rtoMinutes", "rpoMinutes", "recordedAt"
+        FROM service_operational_profiles ORDER BY "ownerService", version DESC
+      ) SELECT sh.*, op.version AS "profileVersion", op."ownerTeam", op."onCallRoute", op."runbookUrl",
+        op."availabilityTargetBps", op."latencyP95TargetMs", op."rtoMinutes", op."rpoMinutes", op."recordedAt" AS "profileRecordedAt"
+      FROM service_health sh LEFT JOIN profile_latest op ON op."ownerService" = sh."ownerService"
+      ORDER BY sh."ownerService" LIMIT $2`, [cursor ?? null, limit + 1]) as Array<{
+      ownerService: string; activePanels: number; registeredRoutes: number;
+      health: 'UNKNOWN' | 'UP' | 'DOWN' | 'DEGRADED' | 'STALE';
+      lastObservedAt: Date | null; averageLatencyMs: number | null;
+      profileVersion: number | null; ownerTeam: string | null; onCallRoute: string | null; runbookUrl: string | null;
+      availabilityTargetBps: number | null; latencyP95TargetMs: number | null;
+      rtoMinutes: number | null; rpoMinutes: number | null; profileRecordedAt: Date | null;
+    }>;
+    const page = rows.slice(0, limit);
+    return {
+      asOf: new Date().toISOString(),
+      services: page.map((row) => {
+        const { profileVersion, ownerTeam, onCallRoute, runbookUrl, availabilityTargetBps,
+          latencyP95TargetMs, rtoMinutes, rpoMinutes, profileRecordedAt, ...service } = row;
+        return {
+          ...service, lastObservedAt: service.lastObservedAt?.toISOString() ?? null,
+          observationSource: service.lastObservedAt ? 'MANUAL_PROBE' as const : null,
+          operationalReadiness: profileVersion ? 'CONFIGURED' as const : 'UNCONFIGURED' as const,
+          operationalProfile: profileVersion ? {
+            version: profileVersion, ownerTeam, onCallRoute, runbookUrl, availabilityTargetBps,
+            latencyP95TargetMs, rtoMinutes, rpoMinutes,
+            recordedAt: profileRecordedAt?.toISOString() ?? null,
+          } : null,
+        };
+      }),
+      nextCursor: rows.length > limit ? page.at(-1)?.ownerService ?? null : null,
+    };
+  }
+
+  async publishServiceOperationalProfile(
+    actor: AuthenticatedPrincipal, ownerService: string, input: ServiceOperationalProfileInput,
+    idempotencyKey: string, correlationId: string,
+  ) {
+    this.requirePlatformAdmin(actor);
+    if (!/^[a-z][a-z0-9-]{1,62}$/.test(ownerService)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'شناسه مالک سرویس نامعتبر است.' });
+    }
+    const normalized = this.validateOperationalProfile(input);
+    return this.dataSource.transaction(async (manager) =>
+      this.idempotent(manager, actor.id, `service.operational-profile.${ownerService}`, idempotencyKey, normalized, async () => {
+        await manager.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`service.operational-profile|${ownerService}`]);
+        const panel = await manager.findOne(PanelEntity, { where: { ownerService, status: 'ACTIVE' } });
+        if (!panel) {
+          throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'سرویس فعال در رجیستری پنل یافت نشد.' });
+        }
+        const current = await manager.findOne(ServiceOperationalProfileEntity, {
+          where: { ownerService }, order: { version: 'DESC' },
+        });
+        const currentVersion = current?.version ?? 0;
+        if (currentVersion !== normalized.expectedCurrentVersion) {
+          throw new ConflictException({
+            code: ErrorCode.CONFLICT,
+            message: 'نسخه پروفایل عملیاتی تغییر کرده است؛ آخرین نسخه را دوباره بخوانید.',
+          });
+        }
+        const saved = await manager.save(ServiceOperationalProfileEntity, {
+          id: randomUUID(), ownerService, version: currentVersion + 1,
+          ownerTeam: normalized.ownerTeam, onCallRoute: normalized.onCallRoute, runbookUrl: normalized.runbookUrl,
+          availabilityTargetBps: normalized.availabilityTargetBps,
+          latencyP95TargetMs: normalized.latencyP95TargetMs,
+          rtoMinutes: normalized.rtoMinutes, rpoMinutes: normalized.rpoMinutes,
+          recordedByPrincipalId: actor.id,
+        });
+        await this.appendControl(manager, {
+          actorId: actor.id, action: 'service.operational_profile.published',
+          objectType: 'service_operational_profile', objectId: saved.id, correlationId,
+          eventName: 'core.service.operational-profile.published.v1',
+          payload: { profileId: saved.id, ownerService, version: String(saved.version) },
+        });
+        return {
+          id: saved.id, ownerService: saved.ownerService, version: saved.version,
+          ownerTeam: saved.ownerTeam, onCallRoute: saved.onCallRoute, runbookUrl: saved.runbookUrl,
+          availabilityTargetBps: saved.availabilityTargetBps, latencyP95TargetMs: saved.latencyP95TargetMs,
+          rtoMinutes: saved.rtoMinutes, rpoMinutes: saved.rpoMinutes,
+          recordedAt: saved.recordedAt.toISOString(),
+        };
+      }),
+    );
+  }
+
+  private recordServiceObservation(
+    routeId: string, status: 'UP' | 'DOWN', latencyMs: number, httpStatus: number | null, errorCode: string | null,
+  ): Promise<ServiceObservationEntity> {
+    return this.dataSource.getRepository(ServiceObservationEntity).save({
+      id: randomUUID(), routeId, status, httpStatus,
+      latencyMs: Math.max(0, Math.min(300000, latencyMs)), errorCode, source: 'MANUAL_PROBE',
+    });
+  }
+
+  async listDeadLetters(actor: AuthenticatedPrincipal): Promise<Array<{
+    id: string; eventId: string; eventName: string; aggregateId: string;
+    attempts: number; lastError: string | null; deadLetterAt: Date | null;
+  }>> {
+    this.requirePlatformAdmin(actor);
+    const events = await this.dataSource.getRepository(OutboxEventEntity).find({
+      where: { publishedAt: IsNull(), deadLetterAt: Not(IsNull()) },
+      order: { deadLetterAt: 'DESC' }, take: 100,
+    });
+    return events.map(({ id, eventId, eventName, aggregateId, attempts, lastError, deadLetterAt }) =>
+      ({ id, eventId, eventName, aggregateId, attempts, lastError, deadLetterAt }));
+  }
+
+  async requeueDeadLetter(actor: AuthenticatedPrincipal, id: string, correlationId: string): Promise<OutboxEventEntity> {
+    this.requirePlatformAdmin(actor);
+    return this.dataSource.transaction(async (manager) => {
+      const event = await manager.findOne(OutboxEventEntity, { where: { id }, lock: { mode: 'pessimistic_write' } });
+      if (!event) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'رویداد یافت نشد.' });
+      if (event.publishedAt || !event.deadLetterAt) {
+        throw new ConflictException({ code: ErrorCode.CONFLICT, message: 'رویداد در صف بررسی مجدد نیست.' });
+      }
+      event.deadLetterAt = null;
+      event.nextAttemptAt = null;
+      event.attempts = 0;
+      event.lastError = null;
+      await manager.save(event);
+      await this.appendControl(manager, {
+        actorId: actor.id, action: 'outbox.dead_letter.requeued', objectType: 'outbox_event', objectId: event.id,
+        correlationId, eventName: 'core.outbox.dead_letter.requeued.v1',
+        payload: { outboxEventId: event.id, eventId: event.eventId },
+      });
+      return event;
+    });
   }
 
   /**
    * Claims a batch with SKIP LOCKED so parallel dispatchers never deliver the same row twice,
    * marks each row published only after the publisher accepts it, and records failures for retry.
-   * The in-process publisher stands in for the broker until one is provisioned.
+   * Broker ingress must durably accept an event before the database row is acknowledged.
+   * Consumers deduplicate by eventId if delivery succeeds but the DB commit fails.
    */
   async dispatchOutbox(): Promise<number> {
     return this.dataSource.transaction(async (manager) => {
@@ -638,14 +1430,15 @@ export class PlatformCoreService {
         .createQueryBuilder(OutboxEventEntity, 'event')
         .setLock('pessimistic_write')
         .setOnLocked('skip_locked')
-        .where('event.publishedAt IS NULL')
+        .where('event.publishedAt IS NULL AND event.deadLetterAt IS NULL')
+        .andWhere('(event.nextAttemptAt IS NULL OR event.nextAttemptAt <= now())')
         .orderBy('event.createdAt', 'ASC')
         .limit(OUTBOX_BATCH)
         .getMany();
       let count = 0;
       for (const event of pending) {
         try {
-          this.publish({
+          await this.publish({
             eventId: event.eventId,
             eventName: event.eventName,
             aggregateId: event.aggregateId,
@@ -653,9 +1446,14 @@ export class PlatformCoreService {
           });
           event.publishedAt = new Date();
           event.lastError = null;
+          event.nextAttemptAt = null;
           count += 1;
         } catch (error) {
           event.lastError = error instanceof Error ? error.message.slice(0, 500) : 'publish failed';
+          const now = new Date();
+          const next = nextOutboxRetryAt(event.attempts + 1, now);
+          event.nextAttemptAt = next;
+          if (!next) event.deadLetterAt = now;
         }
         event.attempts += 1;
         await manager.save(event);
@@ -664,14 +1462,35 @@ export class PlatformCoreService {
     });
   }
 
-  private publish(event: PublishedEvent): void {
-    if (!this.published.some((item) => item.eventId === event.eventId)) {
-      this.published.push(event);
+  private async publish(event: PublishedEvent): Promise<void> {
+    if (!this.env.outboxPublishUrl) {
+      if (this.env.nodeEnv === 'test') {
+        this.acceptedEvents.push(event);
+        return;
+      }
+      throw new Error('OUTBOX_PUBLISH_URL is not configured');
+    }
+    const response = await fetch(this.env.outboxPublishUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': event.eventId,
+        ...(this.env.outboxPublishToken ? { authorization: `Bearer ${this.env.outboxPublishToken}` } : {}),
+      },
+      body: JSON.stringify(event),
+      signal: AbortSignal.timeout(5000),
+    });
+    await response.body?.cancel();
+    if (!response.ok) {
+      throw new Error(`Broker ingress rejected event: HTTP ${response.status}`);
+    }
+    if (this.env.nodeEnv === 'test') {
+      this.acceptedEvents.push(event);
     }
   }
 
   publishedEvents(): PublishedEvent[] {
-    return [...this.published];
+    return [...this.acceptedEvents];
   }
 
   private dummyHash(): Promise<string> {
@@ -715,13 +1534,142 @@ export class PlatformCoreService {
     return result;
   }
 
+  private async authenticatePanelToken(authorization: string | undefined): Promise<{
+    token: string; payload: Record<string, string | number>; principal: PrincipalEntity;
+  }> {
+    const token = this.readBearer(authorization);
+    const unauthenticated = new UnauthorizedException({
+      code: ErrorCode.UNAUTHENTICATED,
+      message: 'نشست معتبر نیست.',
+    });
+    let payload: Record<string, string | number>;
+    try {
+      payload = verifyPanelToken(token, this.env.panelTokenKeys, {
+        issuer: this.env.panelTokenIssuer,
+        nowSeconds: Math.floor(Date.now() / 1000),
+      });
+    } catch {
+      throw unauthenticated;
+    }
+    const sid = typeof payload.sid === 'string' && /^[0-9a-f-]{36}$/i.test(payload.sid) ? payload.sid : null;
+    if (!sid) throw unauthenticated;
+    const session = await this.dataSource.getRepository(SessionEntity).findOne({ where: { id: sid } });
+    if (!session || session.revokedAt || session.expiresAt.getTime() <= Date.now() || session.principalId !== payload.sub) {
+      throw unauthenticated;
+    }
+    const principal = await this.dataSource.getRepository(PrincipalEntity).findOne({ where: { id: session.principalId } });
+    if (!principal || principal.status !== 'ACTIVE' || principal.realm !== payload.realm ||
+      (principal.realm !== 'STAFF' && principal.realm !== 'AGENCY')) {
+      throw unauthenticated;
+    }
+    const tokenTenantId = typeof payload.tenantId === 'string' ? payload.tenantId : null;
+    if ((principal.realm === 'AGENCY' && (!principal.tenantId || tokenTenantId !== principal.tenantId)) ||
+      (principal.realm === 'STAFF' && tokenTenantId !== null)) {
+      throw unauthenticated;
+    }
+    return { token, payload, principal };
+  }
+
+  private async assertRouteAccess(
+    payload: Record<string, string | number>, principal: PrincipalEntity, route: RouteContractEntity, actualPath?: string,
+  ): Promise<void> {
+    const realm = String(payload.realm ?? '');
+    if (payload.aud !== route.audience || !route.allowedRealms.split(',').includes(realm)) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'توکن این پنل برای این مسیر پذیرفته نیست.' });
+    }
+    const panelId = typeof payload.panelId === 'string' && /^[0-9a-f-]{36}$/i.test(payload.panelId) ? payload.panelId : null;
+    const panel = panelId && await this.dataSource.getRepository(PanelEntity).findOne({
+      where: { id: panelId, audience: route.audience, status: 'ACTIVE' },
+    });
+    const entitlement = panel && await this.dataSource.getRepository(EntitlementEntity).findOne({
+      where: { principalId: principal.id, panelId: panel.id, status: 'ACTIVE' },
+    });
+    if (!entitlement) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'دسترسی این پنل لغو شده است.' });
+    }
+    if (principal.realm === 'AGENCY') {
+      const params = actualPath ? this.routeParams(route.pathPattern, actualPath) : null;
+      const routedTenant = route.tenantPathParam && params?.[route.tenantPathParam];
+      if (!routedTenant || routedTenant !== principal.tenantId) {
+        throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'دسترسی بین دو آژانس مجاز نیست.' });
+      }
+    }
+  }
+
+  private pathMatches(pattern: string, actual: string): boolean {
+    return this.routeParams(pattern, actual) !== null;
+  }
+
+  private routeParams(pattern: string, actual: string): Record<string, string> | null {
+    if (!actual.startsWith('/') || /%(?:2f|5c)/i.test(actual)) return null;
+    const expected = pattern.split('/').slice(1);
+    const received = actual.split('/').slice(1);
+    if (expected.length !== received.length) return null;
+    const params: Record<string, string> = {};
+    for (let index = 0; index < expected.length; index += 1) {
+      const segment = expected[index];
+      let value: string;
+      try {
+        value = decodeURIComponent(received[index]);
+      } catch {
+        return null;
+      }
+      if (!/^[A-Za-z0-9._~-]+$/.test(value)) return null;
+      const placeholder = /^\{([A-Za-z][A-Za-z0-9_]{0,62})\}$/.exec(segment);
+      if (placeholder) params[placeholder[1]] = value;
+      else if (segment !== value) return null;
+    }
+    return params;
+  }
+
+  private gatewayTarget(route: RouteContractEntity, path: string, query: string): URL {
+    if (query.length > 2048 || (query && !query.startsWith('?'))) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'پارامترهای مسیر بالادست نامعتبر است.' });
+    }
+    const target = new URL(route.upstreamBaseUrl);
+    const allowedHosts = this.env.gatewayAllowedHosts ?? [];
+    if (allowedHosts.length > 0 && !allowedHosts.includes(target.host.toLowerCase())) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'مقصد مسیر در فهرست مجاز درگاه نیست.' });
+    }
+    target.pathname = `${target.pathname.replace(/\/$/, '')}${path}`;
+    target.search = query;
+    return target;
+  }
+
+  private async readBoundedResponse(response: Response, controller: AbortController): Promise<Buffer> {
+    const max = this.env.gatewayMaxResponseBytes;
+    const declared = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > max) {
+      controller.abort();
+      throw new BadGatewayException({ code: ErrorCode.PAYLOAD_TOO_LARGE, message: 'پاسخ سرویس بالادست از حد مجاز درگاه بزرگ‌تر است.' });
+    }
+    if (!response.body) return Buffer.alloc(0);
+    const reader = response.body.getReader();
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > max) {
+        controller.abort();
+        throw new BadGatewayException({ code: ErrorCode.PAYLOAD_TOO_LARGE, message: 'پاسخ سرویس بالادست از حد مجاز درگاه بزرگ‌تر است.' });
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, total);
+  }
+
   private validateRoute(input: RouteInput): Omit<RouteContractEntity, 'id' | 'createdAt'> {
     const invalid = (message: string) => new BadRequestException({ code: ErrorCode.VALIDATION, message });
     const method = input.method.toUpperCase();
     if (!ROUTE_METHODS.includes(method)) {
       throw invalid('متد مسیر مجاز نیست.');
     }
-    if (!/^\/v\d+(\/[A-Za-z0-9._~{}-]+)+$/.test(input.pathPattern)) {
+    const pathSegments = input.pathPattern.split('/').slice(1);
+    if (!/^\/v\d+(\/[A-Za-z0-9._~{}-]+)+$/.test(input.pathPattern) || pathSegments[0] !== input.version ||
+      pathSegments.slice(1).some((segment) =>
+        !/^[A-Za-z0-9._~-]+$/.test(segment) && !/^\{[A-Za-z][A-Za-z0-9_]{0,62}\}$/.test(segment))) {
       throw invalid('الگوی مسیر باید نسخه‌دار باشد، مانند /v1/crew/roster.');
     }
     if (!/^v\d+$/.test(input.version)) {
@@ -739,9 +1687,24 @@ export class PlatformCoreService {
     if (this.env.nodeEnv === 'production' && upstream.protocol !== 'https:') {
       throw invalid('در محیط عملیاتی نشانی سرویس بالادست باید https باشد.');
     }
+    const allowedHosts = this.env.gatewayAllowedHosts ?? [];
+    if (allowedHosts.length > 0 && !allowedHosts.includes(upstream.host.toLowerCase())) {
+      throw invalid('مقصد سرویس بالادست در فهرست مجاز درگاه نیست.');
+    }
     const realms = [...new Set(input.allowedRealms)];
-    if (realms.length === 0 || realms.some((realm) => !REALMS.includes(realm as PrincipalEntity['realm']))) {
+    if (realms.length !== 1 || realms.some((realm) => !GATEWAY_REALMS.includes(realm as PrincipalEntity['realm']))) {
       throw invalid('قلمرو مجاز مسیر نامعتبر است.');
+    }
+    const agencyRoute = realms[0] === 'AGENCY';
+    if ((agencyRoute && !input.audience.startsWith('agency:')) || (!agencyRoute && !input.audience.startsWith('panel:'))) {
+      throw invalid('مخاطب مسیر با قلمرو کانال سازگار نیست.');
+    }
+    if (agencyRoute) {
+      if (!input.tenantPathParam || !pathSegments.includes(`{${input.tenantPathParam}}`)) {
+        throw invalid('مسیر آژانس باید پارامتر tenantPathParam را در الگوی مسیر داشته باشد.');
+      }
+    } else if (input.tenantPathParam) {
+      throw invalid('پارامتر tenantPathParam فقط برای مسیر آژانس مجاز است.');
     }
     return {
       method,
@@ -751,7 +1714,33 @@ export class PlatformCoreService {
       timeoutMs: input.timeoutMs,
       allowedRealms: realms.join(','),
       version: input.version,
+      tenantPathParam: input.tenantPathParam ?? null,
     };
+  }
+
+  private validateOperationalProfile(input: ServiceOperationalProfileInput): ServiceOperationalProfileInput {
+    const invalid = (message: string) => new BadRequestException({ code: ErrorCode.VALIDATION, message });
+    const ownerTeam = input.ownerTeam.trim();
+    const onCallRoute = input.onCallRoute.trim();
+    if (!ownerTeam || ownerTeam.length > 120 || !onCallRoute || onCallRoute.length > 160) {
+      throw invalid('مالک پاسخ‌گو یا مسیر آنکال نامعتبر است.');
+    }
+    let runbook: URL;
+    try {
+      runbook = new URL(input.runbookUrl);
+    } catch {
+      throw invalid('نشانی Runbook نامعتبر است.');
+    }
+    if (runbook.protocol !== 'https:' || runbook.username || runbook.password || runbook.hash) {
+      throw invalid('نشانی Runbook باید HTTPS و بدون اعتبارنامه یا fragment باشد.');
+    }
+    const inRange = (value: number, min: number, max: number) => Number.isInteger(value) && value >= min && value <= max;
+    if (!inRange(input.expectedCurrentVersion, 0, 2147483647) ||
+      !inRange(input.availabilityTargetBps, 1, 10000) || !inRange(input.latencyP95TargetMs, 1, 300000) ||
+      !inRange(input.rtoMinutes, 1, 525600) || !inRange(input.rpoMinutes, 0, 525600)) {
+      throw invalid('اهداف دسترس‌پذیری، تأخیر یا بازیابی نامعتبر است.');
+    }
+    return { ...input, ownerTeam, onCallRoute, runbookUrl: runbook.toString() };
   }
 
   private async openSession(principalId: string) {
@@ -778,6 +1767,7 @@ export class PlatformCoreService {
         realm: principal.realm,
         username: principal.username,
         role: principal.role,
+        tenantId: principal.tenantId,
         sessionId: session.id,
         csrfToken,
       },
@@ -790,7 +1780,7 @@ export class PlatformCoreService {
   private async appendControl(
     manager: EntityManager,
     input: {
-      actorId: string;
+      actorId: string | null;
       action: string;
       objectType: string;
       objectId: string;
@@ -799,9 +1789,11 @@ export class PlatformCoreService {
       payload: Record<string, string>;
     },
   ): Promise<void> {
+    const actor = input.actorId ? await manager.findOneByOrFail(PrincipalEntity, { id: input.actorId }) : null;
     await manager.save(AuditEventEntity, {
       id: randomUUID(),
       actorPrincipalId: input.actorId,
+      tenantId: actor?.tenantId ?? null,
       action: input.action,
       objectType: input.objectType,
       objectId: input.objectId,
@@ -810,10 +1802,12 @@ export class PlatformCoreService {
     await manager.save(OutboxEventEntity, {
       id: randomUUID(),
       eventId: randomUUID(),
-      eventName: input.eventName,
-      aggregateId: input.objectId,
-      payload: input.payload,
-      publishedAt: null,
+        eventName: input.eventName,
+        aggregateId: input.objectId,
+        payload: input.payload,
+        publishedAt: null,
+        nextAttemptAt: null,
+        deadLetterAt: null,
     });
   }
 

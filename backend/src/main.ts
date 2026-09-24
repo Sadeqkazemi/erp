@@ -8,6 +8,7 @@ import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module';
 import { assertProductionSafe, loadEnv } from './config/env';
 import { createDataSource } from './database/data-source';
+import { PlatformCoreService } from './modules/platform-core.service';
 
 async function bootstrap(): Promise<void> {
   const env = loadEnv();
@@ -32,6 +33,20 @@ async function bootstrap(): Promise<void> {
   }
   app.enableShutdownHooks();
   await app.listen(env.port);
+  // Database row locks coordinate dispatcher replicas; failed deliveries remain pending.
+  const core = app.get(PlatformCoreService);
+  const dispatchTimer = setInterval(() => {
+    void core.dispatchOutbox().catch((error: unknown) => {
+      process.stderr.write(`Outbox dispatch failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    });
+  }, 5000);
+  const workflowTimer = setInterval(() => {
+    void core.expireWorkflowSteps().catch((error: unknown) => {
+      process.stderr.write(`Workflow timer failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    });
+  }, 5000);
+  app.getHttpServer().on('close', () => clearInterval(dispatchTimer));
+  app.getHttpServer().on('close', () => clearInterval(workflowTimer));
 }
 
 void bootstrap();
