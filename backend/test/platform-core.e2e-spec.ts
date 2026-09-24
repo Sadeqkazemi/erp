@@ -7,6 +7,7 @@ import { generateKeyPairSync } from 'crypto';
 import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { createServer, Server } from 'http';
 import request from 'supertest';
 import { AppModule } from '../src/app.module';
 import { loadEnv } from '../src/config/env';
@@ -31,8 +32,61 @@ describe('platform core', () => {
   let adminPassword = '';
   let staffId = '';
   let staffTotp = '';
+  let broker: Server;
+  const delivered = new Set<string>();
+  const gatewayRequests: Array<Record<string, unknown>> = [];
+  let brokerAvailable = true;
 
   beforeAll(async () => {
+    broker = createServer((req, res) => {
+      if (!brokerAvailable) {
+        res.writeHead(503).end();
+        return;
+      }
+      if (req.url?.startsWith('/v1/gateway-fixture/')) {
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          const received = {
+            method: req.method,
+            url: req.url,
+            body: raw ? JSON.parse(raw) as unknown : null,
+            authorization: req.headers.authorization,
+            idempotencyKey: req.headers['idempotency-key'],
+            cookie: req.headers.cookie ?? null,
+            requestId: req.headers['x-request-id'],
+          };
+          gatewayRequests.push(received);
+          if (req.url?.startsWith('/v1/gateway-fixture/redirect')) {
+            res.setHeader('location', 'https://untrusted.example/redirected');
+            res.writeHead(302).end();
+            return;
+          }
+          if (req.url?.startsWith('/v1/gateway-fixture/large')) {
+            const large = JSON.stringify({ payload: 'x'.repeat(2048) });
+            res.setHeader('content-type', 'application/json');
+            res.setHeader('content-length', String(Buffer.byteLength(large)));
+            res.writeHead(200).end(large);
+            return;
+          }
+          res.setHeader('content-type', 'application/json');
+          res.setHeader('set-cookie', 'domain-session=must-not-leak');
+          res.setHeader('x-internal-secret', 'must-not-leak');
+          res.writeHead(200).end(JSON.stringify(received));
+        });
+        return;
+      }
+      const key = req.headers['idempotency-key'];
+      if (typeof key === 'string') delivered.add(key);
+      req.resume();
+      res.writeHead(202).end();
+    });
+    await new Promise<void>((resolve) => broker.listen(0, '127.0.0.1', resolve));
+    const address = broker.address();
+    if (!address || typeof address === 'string') throw new Error('Broker fixture did not bind');
+    process.env.OUTBOX_PUBLISH_URL = `http://127.0.0.1:${address.port}`;
+    process.env.OUTBOX_PUBLISH_TOKEN = 'test-token';
     const externalUrl = process.env.PLATFORM_CORE_TEST_DATABASE_URL;
     if (externalUrl) {
       process.env.DATABASE_URL = externalUrl;
@@ -76,6 +130,8 @@ describe('platform core', () => {
     process.env.MFA_ENCRYPTION_KEY = '11'.repeat(32);
     process.env.ALLOWED_ORIGINS = ORIGIN;
     process.env.SESSION_TTL_SECONDS = '900';
+    process.env.GATEWAY_MAX_REQUEST_BYTES = '1024';
+    process.env.GATEWAY_MAX_RESPONSE_BYTES = '1024';
     const env = loadEnv();
     // Schema is applied with the migration role when CI provides one; the app then runs as the runtime role.
     const migrator = createDataSource(process.env.PLATFORM_CORE_TEST_MIGRATION_DATABASE_URL ?? env.databaseUrl);
@@ -122,6 +178,7 @@ describe('platform core', () => {
   afterAll(async () => {
     await app?.close();
     await dataSource?.destroy();
+    if (broker) await new Promise<void>((resolve, reject) => broker.close((error) => error ? reject(error) : resolve()));
     if (dataDir && ownsCluster) {
       spawnSync(join(postgresBin, `pg_ctl${exe}`), ['-D', dataDir, '-w', '-m', 'fast', 'stop'], { encoding: 'utf8' });
     }
@@ -257,6 +314,61 @@ describe('platform core', () => {
       .expect(201);
     expect(allowed.body.data.audience).toBe('panel:crew');
 
+    const gatewayRoute = await request(app.getHttpServer())
+      .post('/v1/gateway/routes')
+      .set('Cookie', admin.cookie)
+      .set('Origin', ORIGIN)
+      .set('X-CSRF-Token', admin.csrf)
+      .send({
+        method: 'POST',
+        pathPattern: '/v1/gateway-fixture/{id}',
+        upstreamBaseUrl: new URL(process.env.OUTBOX_PUBLISH_URL ?? '').origin,
+        audience: 'panel:crew',
+        timeoutMs: 500,
+        allowedRealms: 'STAFF',
+        version: 'v1',
+      })
+      .expect(201);
+    const forwarded = await request(app.getHttpServer())
+      .post(`/v1/gateway/routes/${gatewayRoute.body.data.id}/forward/v1/gateway-fixture/abc-123?day=1`)
+      .set('Authorization', `Bearer ${token.body.data.token}`)
+      .set('Cookie', 'untrusted-domain-cookie=secret')
+      .set('Idempotency-Key', 'domain-write-0001')
+      .send({ action: 'inspect' })
+      .expect(200);
+    expect(forwarded.body).toMatchObject({
+      method: 'POST', url: '/v1/gateway-fixture/abc-123?day=1', body: { action: 'inspect' },
+      idempotencyKey: 'domain-write-0001', cookie: null,
+    });
+    expect(forwarded.body.authorization).toMatch(/^Bearer /);
+    expect(forwarded.body.requestId).toMatch(/^[A-Za-z0-9._:-]{8,128}$/);
+    expect(forwarded.headers['set-cookie']).toBeUndefined();
+    expect(forwarded.headers['x-internal-secret']).toBeUndefined();
+    expect(gatewayRequests).toHaveLength(1);
+    await request(app.getHttpServer())
+      .post(`/v1/gateway/routes/${gatewayRoute.body.data.id}/forward/v1/not-the-contract`)
+      .set('Authorization', `Bearer ${token.body.data.token}`)
+      .send({ action: 'deny' })
+      .expect(403);
+    const redirect = await request(app.getHttpServer())
+      .post(`/v1/gateway/routes/${gatewayRoute.body.data.id}/forward/v1/gateway-fixture/redirect`)
+      .set('Authorization', `Bearer ${token.body.data.token}`)
+      .send({ action: 'redirect' })
+      .expect(502);
+    expect(redirect.body.error.code).toBe('UPSTREAM_REJECTED');
+    const large = await request(app.getHttpServer())
+      .post(`/v1/gateway/routes/${gatewayRoute.body.data.id}/forward/v1/gateway-fixture/large`)
+      .set('Authorization', `Bearer ${token.body.data.token}`)
+      .send({ action: 'large' })
+      .expect(502);
+    expect(large.body.error.code).toBe('PAYLOAD_TOO_LARGE');
+    const oversized = await request(app.getHttpServer())
+      .post(`/v1/gateway/routes/${gatewayRoute.body.data.id}/forward/v1/gateway-fixture/oversized`)
+      .set('Authorization', `Bearer ${token.body.data.token}`)
+      .send({ payload: 'x'.repeat(1500) })
+      .expect(413);
+    expect(oversized.body.error.code).toBe('PAYLOAD_TOO_LARGE');
+
     const customerSession = await login('09120000000', 'Customer-pass-1');
     const customerPanels = await request(app.getHttpServer())
       .post('/v1/panels')
@@ -343,11 +455,11 @@ describe('platform core', () => {
       .expect(409);
     expect(illegal.body.error.code).toBe('ILLEGAL_TRANSITION');
     const first = await core.dispatchOutbox();
-    const published = core.publishedEvents().length;
+    const published = delivered.size;
     const second = await core.dispatchOutbox();
     expect(first).toBeGreaterThan(0);
     expect(second).toBe(0);
-    expect(core.publishedEvents().length).toBe(published);
+    expect(delivered.size).toBe(published);
   });
 
   describe('hardening regressions', () => {
@@ -539,12 +651,22 @@ describe('platform core', () => {
       const admin = await adminLogin();
       await mutate(request(app.getHttpServer()).post('/v1/panels'), admin).set('Idempotency-Key', 'panel-outbox-01').send(panelBody('outbox'));
       const [{ n: pending }] = (await dataSource.query('SELECT count(*)::int AS n FROM outbox_events WHERE "publishedAt" IS NULL')) as { n: number }[];
-      const before = core.publishedEvents().length;
+      const before = delivered.size;
       const counts = await Promise.all([core.dispatchOutbox(), core.dispatchOutbox(), core.dispatchOutbox()]);
       expect(counts.reduce((a, b) => a + b, 0)).toBe(pending);
-      expect(core.publishedEvents().length - before).toBe(pending);
+      expect(delivered.size - before).toBe(pending);
       const [{ n: left }] = (await dataSource.query('SELECT count(*)::int AS n FROM outbox_events WHERE "publishedAt" IS NULL')) as { n: number }[];
       expect(left).toBe(0);
+    });
+    it('keeps unacknowledged events pending and retries after the broker recovers', async () => {
+      const admin = await adminLogin();
+      await mutate(request(app.getHttpServer()).post('/v1/panels'), admin).set('Idempotency-Key', 'panel-retry-01').send(panelBody('retry'));
+      brokerAvailable = false;
+      expect(await core.dispatchOutbox()).toBe(0);
+      const [{ n: pending }] = (await dataSource.query('SELECT count(*)::int AS n FROM outbox_events WHERE "publishedAt" IS NULL')) as { n: number }[];
+      expect(pending).toBeGreaterThan(0);
+      brokerAvailable = true;
+      expect(await core.dispatchOutbox()).toBe(pending);
     });
   });
 });

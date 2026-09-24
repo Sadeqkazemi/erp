@@ -21,6 +21,7 @@ The core is a control plane. These routes do not create bookings, tickets, inven
 | POST | `/v1/panels/:code/access-tokens` | entitled staff + CSRF + Origin | Short-lived EdDSA token (`iss`, `sub`, `aud`, `realm`, `panelId`, `sid`, `jti`, `iat`, `exp`). It stops working when its session is revoked or panel access is removed |
 | POST | `/v1/gateway/routes` | platform admin + CSRF + Origin | Register a versioned route contract (`/vN/...`, `http(s)` upstream without credentials). Audited |
 | POST | `/v1/gateway/decisions` | panel bearer token | Body `{ method, pathPattern, version }`. Requires a live session, active staff principal, active panel and current entitlement; audience and realm must match. Domain services still enforce object permissions |
+| `GET/POST/PUT/PATCH/DELETE` | `/v1/gateway/routes/:routeId/forward/<versioned-path>` | panel bearer token | Forward a request only when method, concrete path, token audience/realm, active panel and current entitlement match the registered route. Exact production destination hosts come from `GATEWAY_ALLOWED_HOSTS`; redirects, encoded slashes, oversized bodies/responses and unregistered paths fail closed |
 | POST | `/v1/gateway/routes/:id/probe` | platform admin + CSRF + Origin | Upstream timeout stays inside the gateway call. Core health stays up. Redirects are not followed |
 | POST | `/v1/workflow-runs` | staff + CSRF + Origin + idempotency key | Start workflow engine state only |
 | POST | `/v1/workflow-runs/:id/transitions` | run starter or platform admin + CSRF + Origin | Legal engine transitions only, serialised per run |
@@ -51,3 +52,5 @@ The service catalog returns `operationalReadiness=CONFIGURED` and the latest ope
 `X-Request-Id` is echoed when it matches `[A-Za-z0-9._:-]{8,128}`; otherwise the server generates one.
 
 Session cookie in production: `__Host-bj_session`; `Secure`; `HttpOnly`; `Path=/`; `SameSite=Lax`; no `Domain`. CSRF header: `X-CSRF-Token`. State-changing cookie calls also require an allowed `Origin`.
+
+Gateway forwarding is JSON-only. It forwards only `Authorization` (the short-lived panel token), `Accept`, `Content-Type`, `Idempotency-Key`, `If-Match`, `If-None-Match` and the core-generated `X-Request-Id`. Browser cookies and arbitrary identity headers never reach the domain service. Responses expose only `Cache-Control`, `Content-Type`, `ETag`, `Last-Modified` and `Retry-After`; `Set-Cookie`, redirects and other upstream headers are stripped. Domain services must verify the panel token from JWKS and enforce their own tenant/object authorization.

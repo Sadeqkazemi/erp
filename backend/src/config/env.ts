@@ -18,6 +18,9 @@ export interface CoreEnv {
   outboxPublishUrl: string | null;
   outboxPublishToken: string | null;
   workflowDefinitionsRequired: boolean;
+  gatewayAllowedHosts: string[];
+  gatewayMaxRequestBytes: number;
+  gatewayMaxResponseBytes: number;
 }
 
 function parseBoolean(source: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
@@ -82,6 +85,16 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): CoreEnv {
   if (production && (!outboxPublishUrl || !outboxPublishToken)) {
     throw new Error('OUTBOX_PUBLISH_URL and OUTBOX_PUBLISH_TOKEN are required in production');
   }
+  const gatewayAllowedHosts = (source.GATEWAY_ALLOWED_HOSTS ?? '')
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) => item.length > 0);
+  if (gatewayAllowedHosts.some((host) => !/^[a-z0-9.-]+(?::\d{1,5})?$/.test(host))) {
+    throw new Error('GATEWAY_ALLOWED_HOSTS must contain exact host or host:port values');
+  }
+  if (production && gatewayAllowedHosts.length === 0) {
+    throw new Error('GATEWAY_ALLOWED_HOSTS is required in production');
+  }
   return {
     nodeEnv,
     port: parsePositiveInt(source, 'PORT', 3000),
@@ -98,6 +111,9 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): CoreEnv {
     outboxPublishUrl,
     outboxPublishToken,
     workflowDefinitionsRequired: production,
+    gatewayAllowedHosts,
+    gatewayMaxRequestBytes: parsePositiveInt(source, 'GATEWAY_MAX_REQUEST_BYTES', 262_144),
+    gatewayMaxResponseBytes: parsePositiveInt(source, 'GATEWAY_MAX_RESPONSE_BYTES', 1_048_576),
   };
 }
 
@@ -113,7 +129,7 @@ export function assertProductionSafe(env: CoreEnv): void {
   if (env.nodeEnv !== 'production') {
     return;
   }
-  if (!env.cookieSecure || env.allowTestBootstrap || env.exposeApiDocs) {
+  if (!env.cookieSecure || env.allowTestBootstrap || env.exposeApiDocs || env.gatewayAllowedHosts.length === 0) {
     throw new Error('Production cookie, bootstrap and API docs flags are unsafe');
   }
 }

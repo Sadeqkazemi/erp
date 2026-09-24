@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Get, Headers, Param, ParseUUIDPipe, Post, Query, Req, Res, UnauthorizedException, Delete } from '@nestjs/common';
+import { All, BadRequestException, Body, Controller, Get, Headers, Param, ParseUUIDPipe, Post, Query, Req, Res, UnauthorizedException, Delete } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import { ApiOperation, ApiProperty, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
@@ -437,6 +437,35 @@ export class PlatformCoreController {
   async decide(@Req() req: Request, @Body() dto: GatewayDecisionDto) {
     const data = await this.core.decideRoute(req.header('authorization'), dto);
     return { success: true, data };
+  }
+
+  @All('v1/gateway/routes/:id/forward/{*upstreamPath}')
+  @Throttle({ default: { limit: 120, ttl: 60_000 } })
+  @ApiOperation({ summary: 'ارسال کنترل‌شده درخواست پنل به مسیر ثبت‌شده سرویس مالک' })
+  async forward(
+    @Req() req: AuthedRequest, @Res() res: Response, @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<void> {
+    const parsed = new URL(req.originalUrl, 'http://gateway.local');
+    const marker = `/v1/gateway/routes/${id}/forward`;
+    const path = parsed.pathname.startsWith(marker) ? parsed.pathname.slice(marker.length) : '';
+    if (!path.startsWith('/')) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'مسیر مقصد درگاه نامعتبر است.' });
+    }
+    const result = await this.core.forwardRoute(req.header('authorization'), id, {
+      method: req.method,
+      path,
+      query: parsed.search,
+      body: req.body as unknown,
+      headers: req.headers,
+      correlationId: this.correlation(req),
+    });
+    res.status(result.status);
+    for (const [name, value] of Object.entries(result.headers)) res.setHeader(name, value);
+    if (result.status === 204 || result.status === 304 || result.body.length === 0) {
+      res.end();
+      return;
+    }
+    res.send(result.body);
   }
 
   @Get('.well-known/jwks.json')

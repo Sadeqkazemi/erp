@@ -1,4 +1,15 @@
-import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import {
+  BadGatewayException,
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  GatewayTimeoutException,
+  Inject,
+  Injectable,
+  NotFoundException,
+  PayloadTooLargeException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { DataSource, EntityManager, In, IsNull, LessThanOrEqual, Not } from 'typeorm';
 import { randomUUID } from 'crypto';
 import * as argon2 from 'argon2';
@@ -55,6 +66,8 @@ const ARGON2_OPTIONS = { memoryCost: 19_456, timeCost: 2, parallelism: 1 } as co
 const ROUTE_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
 const REALMS: PrincipalEntity['realm'][] = ['STAFF', 'CUSTOMER', 'AGENCY', 'WORKLOAD'];
 const OUTBOX_BATCH = 100;
+const FORWARDED_REQUEST_HEADERS = ['accept', 'content-type', 'idempotency-key', 'if-match', 'if-none-match'] as const;
+const FORWARDED_RESPONSE_HEADERS = ['cache-control', 'content-type', 'etag', 'last-modified', 'retry-after'] as const;
 
 export interface RouteInput {
   method: string;
@@ -91,6 +104,21 @@ export interface ServiceOperationalProfileInput {
   latencyP95TargetMs: number;
   rtoMinutes: number;
   rpoMinutes: number;
+}
+
+export interface GatewayForwardInput {
+  method: string;
+  path: string;
+  query: string;
+  body: unknown;
+  headers: Record<string, string | string[] | undefined>;
+  correlationId: string;
+}
+
+export interface GatewayForwardResult {
+  status: number;
+  headers: Record<string, string>;
+  body: Buffer;
 }
 
 @Injectable()
@@ -582,63 +610,107 @@ export class PlatformCoreService {
     timeoutMs: number;
     version: string;
   }> {
-    const token = this.readBearer(authorization);
-    const unauthenticated = new UnauthorizedException({
-      code: ErrorCode.UNAUTHENTICATED,
-      message: 'نشست معتبر نیست.',
-    });
-    let payload: Record<string, string | number>;
-    try {
-      payload = verifyPanelToken(token, this.env.panelTokenKeys, {
-        issuer: this.env.panelTokenIssuer,
-        nowSeconds: Math.floor(Date.now() / 1000),
-      });
-    } catch {
-      throw unauthenticated;
-    }
-    // A panel token dies with the session that issued it (logout, rotation, expiry).
-    const sid = typeof payload.sid === 'string' && /^[0-9a-f-]{36}$/i.test(payload.sid) ? payload.sid : null;
-    if (!sid) {
-      throw unauthenticated;
-    }
-    const session = await this.dataSource.getRepository(SessionEntity).findOne({ where: { id: sid } });
-    if (!session || session.revokedAt || session.expiresAt.getTime() <= Date.now() || session.principalId !== payload.sub) {
-      throw unauthenticated;
-    }
-    const principal = await this.dataSource.getRepository(PrincipalEntity).findOne({ where: { id: session.principalId } });
-    if (!principal || principal.status !== 'ACTIVE' || principal.realm !== payload.realm || principal.realm !== 'STAFF') {
-      throw unauthenticated;
-    }
+    const { payload, principal } = await this.authenticatePanelToken(authorization);
     const route = await this.dataSource.getRepository(RouteContractEntity).findOne({
       where: { method: request.method.toUpperCase(), pathPattern: request.pathPattern, version: request.version },
     });
     if (!route) {
       throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'مسیر درگاه یافت نشد.' });
     }
-    const realm = String(payload.realm ?? '');
-    const allowed = route.allowedRealms.split(',');
-    if (payload.aud !== route.audience || !allowed.includes(realm)) {
-      throw new ForbiddenException({
-        code: ErrorCode.FORBIDDEN,
-        message: 'توکن این پنل برای این مسیر پذیرفته نیست.',
-      });
-    }
-    const panelId = typeof payload.panelId === 'string' && /^[0-9a-f-]{36}$/i.test(payload.panelId) ? payload.panelId : null;
-    const panel = panelId && await this.dataSource.getRepository(PanelEntity).findOne({
-      where: { id: panelId, audience: route.audience, status: 'ACTIVE' },
-    });
-    const entitlement = panel && await this.dataSource.getRepository(EntitlementEntity).findOne({
-      where: { principalId: principal.id, panelId: panel.id, status: 'ACTIVE' },
-    });
-    if (!entitlement) {
-      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'دسترسی این پنل لغو شده است.' });
-    }
+    await this.assertRouteAccess(payload, principal, route);
     return {
       audience: route.audience,
       upstreamBaseUrl: route.upstreamBaseUrl,
       timeoutMs: route.timeoutMs,
       version: route.version,
     };
+  }
+
+  async forwardRoute(
+    authorization: string | undefined, routeId: string, request: GatewayForwardInput,
+  ): Promise<GatewayForwardResult> {
+    const { payload, principal, token } = await this.authenticatePanelToken(authorization);
+    const route = await this.dataSource.getRepository(RouteContractEntity).findOne({ where: { id: routeId } });
+    if (!route) {
+      throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'مسیر درگاه یافت نشد.' });
+    }
+    const method = request.method.toUpperCase();
+    if (method !== route.method || !this.pathMatches(route.pathPattern, request.path)) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'درخواست با قرارداد مسیر مطابقت ندارد.' });
+    }
+    await this.assertRouteAccess(payload, principal, route);
+    const target = this.gatewayTarget(route, request.path, request.query);
+    const outgoingHeaders: Record<string, string> = {
+      authorization: `Bearer ${token}`,
+      'x-request-id': request.correlationId,
+    };
+    for (const name of FORWARDED_REQUEST_HEADERS) {
+      const value = request.headers[name];
+      if (typeof value === 'string' && value.length <= 512 && !/[\r\n]/.test(value)) {
+        outgoingHeaders[name] = value;
+      }
+    }
+    if (outgoingHeaders['idempotency-key'] && !/^[A-Za-z0-9_-]{8,128}$/.test(outgoingHeaders['idempotency-key'])) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'کلید تکرار درخواست بالادست نامعتبر است.' });
+    }
+    let body: string | undefined;
+    if (request.body !== undefined && request.body !== null) {
+      if (method === 'GET') {
+        throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'درخواست GET نباید بدنه داشته باشد.' });
+      }
+      const contentType = outgoingHeaders['content-type']?.toLowerCase() ?? 'application/json';
+      if (!(contentType.startsWith('application/json') || contentType.includes('+json'))) {
+        throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'درگاه فعلاً فقط بدنه JSON را می‌پذیرد.' });
+      }
+      body = JSON.stringify(request.body);
+      if (Buffer.byteLength(body) > this.env.gatewayMaxRequestBytes) {
+        throw new PayloadTooLargeException({ code: ErrorCode.PAYLOAD_TOO_LARGE, message: 'حجم درخواست از حد مجاز مسیر بیشتر است.' });
+      }
+      outgoingHeaders['content-type'] = contentType;
+    } else {
+      delete outgoingHeaders['content-type'];
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), route.timeoutMs);
+    let response: Response;
+    try {
+      response = await fetch(target, {
+        method,
+        headers: outgoingHeaders,
+        body,
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+    } catch {
+      clearTimeout(timer);
+      throw new GatewayTimeoutException({
+        code: ErrorCode.UPSTREAM_TIMEOUT,
+        message: 'سرویس بالادست در مهلت قرارداد پاسخ نداد.',
+      });
+    }
+    if (response.status >= 300 && response.status < 400 && response.status !== 304) {
+      clearTimeout(timer);
+      await response.body?.cancel();
+      throw new BadGatewayException({ code: ErrorCode.UPSTREAM_REJECTED, message: 'تغییر مسیر بالادست توسط درگاه پذیرفته نشد.' });
+    }
+    let responseBody: Buffer;
+    try {
+      responseBody = await this.readBoundedResponse(response, controller);
+    } catch (error) {
+      if (error instanceof BadGatewayException) throw error;
+      throw new GatewayTimeoutException({
+        code: ErrorCode.UPSTREAM_TIMEOUT,
+        message: 'خواندن پاسخ سرویس بالادست در مهلت قرارداد کامل نشد.',
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    const responseHeaders: Record<string, string> = {};
+    for (const name of FORWARDED_RESPONSE_HEADERS) {
+      const value = response.headers.get(name);
+      if (value && value.length <= 1024 && !/[\r\n]/.test(value)) responseHeaders[name] = value;
+    }
+    return { status: response.status, headers: responseHeaders, body: responseBody };
   }
 
   async probeUpstream(actor: AuthenticatedPrincipal, routeId: string): Promise<{
@@ -1325,13 +1397,120 @@ export class PlatformCoreService {
     return result;
   }
 
+  private async authenticatePanelToken(authorization: string | undefined): Promise<{
+    token: string; payload: Record<string, string | number>; principal: PrincipalEntity;
+  }> {
+    const token = this.readBearer(authorization);
+    const unauthenticated = new UnauthorizedException({
+      code: ErrorCode.UNAUTHENTICATED,
+      message: 'نشست معتبر نیست.',
+    });
+    let payload: Record<string, string | number>;
+    try {
+      payload = verifyPanelToken(token, this.env.panelTokenKeys, {
+        issuer: this.env.panelTokenIssuer,
+        nowSeconds: Math.floor(Date.now() / 1000),
+      });
+    } catch {
+      throw unauthenticated;
+    }
+    const sid = typeof payload.sid === 'string' && /^[0-9a-f-]{36}$/i.test(payload.sid) ? payload.sid : null;
+    if (!sid) throw unauthenticated;
+    const session = await this.dataSource.getRepository(SessionEntity).findOne({ where: { id: sid } });
+    if (!session || session.revokedAt || session.expiresAt.getTime() <= Date.now() || session.principalId !== payload.sub) {
+      throw unauthenticated;
+    }
+    const principal = await this.dataSource.getRepository(PrincipalEntity).findOne({ where: { id: session.principalId } });
+    if (!principal || principal.status !== 'ACTIVE' || principal.realm !== payload.realm || principal.realm !== 'STAFF') {
+      throw unauthenticated;
+    }
+    return { token, payload, principal };
+  }
+
+  private async assertRouteAccess(
+    payload: Record<string, string | number>, principal: PrincipalEntity, route: RouteContractEntity,
+  ): Promise<void> {
+    const realm = String(payload.realm ?? '');
+    if (payload.aud !== route.audience || !route.allowedRealms.split(',').includes(realm)) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'توکن این پنل برای این مسیر پذیرفته نیست.' });
+    }
+    const panelId = typeof payload.panelId === 'string' && /^[0-9a-f-]{36}$/i.test(payload.panelId) ? payload.panelId : null;
+    const panel = panelId && await this.dataSource.getRepository(PanelEntity).findOne({
+      where: { id: panelId, audience: route.audience, status: 'ACTIVE' },
+    });
+    const entitlement = panel && await this.dataSource.getRepository(EntitlementEntity).findOne({
+      where: { principalId: principal.id, panelId: panel.id, status: 'ACTIVE' },
+    });
+    if (!entitlement) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'دسترسی این پنل لغو شده است.' });
+    }
+  }
+
+  private pathMatches(pattern: string, actual: string): boolean {
+    if (!actual.startsWith('/') || /%(?:2f|5c)/i.test(actual)) return false;
+    const expected = pattern.split('/').slice(1);
+    const received = actual.split('/').slice(1);
+    if (expected.length !== received.length) return false;
+    return expected.every((segment, index) => {
+      let value: string;
+      try {
+        value = decodeURIComponent(received[index]);
+      } catch {
+        return false;
+      }
+      if (!/^[A-Za-z0-9._~-]+$/.test(value)) return false;
+      return /^\{[A-Za-z][A-Za-z0-9_]{0,62}\}$/.test(segment) || segment === value;
+    });
+  }
+
+  private gatewayTarget(route: RouteContractEntity, path: string, query: string): URL {
+    if (query.length > 2048 || (query && !query.startsWith('?'))) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'پارامترهای مسیر بالادست نامعتبر است.' });
+    }
+    const target = new URL(route.upstreamBaseUrl);
+    const allowedHosts = this.env.gatewayAllowedHosts ?? [];
+    if (allowedHosts.length > 0 && !allowedHosts.includes(target.host.toLowerCase())) {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'مقصد مسیر در فهرست مجاز درگاه نیست.' });
+    }
+    target.pathname = `${target.pathname.replace(/\/$/, '')}${path}`;
+    target.search = query;
+    return target;
+  }
+
+  private async readBoundedResponse(response: Response, controller: AbortController): Promise<Buffer> {
+    const max = this.env.gatewayMaxResponseBytes;
+    const declared = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > max) {
+      controller.abort();
+      throw new BadGatewayException({ code: ErrorCode.PAYLOAD_TOO_LARGE, message: 'پاسخ سرویس بالادست از حد مجاز درگاه بزرگ‌تر است.' });
+    }
+    if (!response.body) return Buffer.alloc(0);
+    const reader = response.body.getReader();
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > max) {
+        controller.abort();
+        throw new BadGatewayException({ code: ErrorCode.PAYLOAD_TOO_LARGE, message: 'پاسخ سرویس بالادست از حد مجاز درگاه بزرگ‌تر است.' });
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, total);
+  }
+
   private validateRoute(input: RouteInput): Omit<RouteContractEntity, 'id' | 'createdAt'> {
     const invalid = (message: string) => new BadRequestException({ code: ErrorCode.VALIDATION, message });
     const method = input.method.toUpperCase();
     if (!ROUTE_METHODS.includes(method)) {
       throw invalid('متد مسیر مجاز نیست.');
     }
-    if (!/^\/v\d+(\/[A-Za-z0-9._~{}-]+)+$/.test(input.pathPattern)) {
+    const pathSegments = input.pathPattern.split('/').slice(1);
+    if (!/^\/v\d+(\/[A-Za-z0-9._~{}-]+)+$/.test(input.pathPattern) || pathSegments[0] !== input.version ||
+      pathSegments.slice(1).some((segment) =>
+        !/^[A-Za-z0-9._~-]+$/.test(segment) && !/^\{[A-Za-z][A-Za-z0-9_]{0,62}\}$/.test(segment))) {
       throw invalid('الگوی مسیر باید نسخه‌دار باشد، مانند /v1/crew/roster.');
     }
     if (!/^v\d+$/.test(input.version)) {
@@ -1348,6 +1527,10 @@ export class PlatformCoreService {
     }
     if (this.env.nodeEnv === 'production' && upstream.protocol !== 'https:') {
       throw invalid('در محیط عملیاتی نشانی سرویس بالادست باید https باشد.');
+    }
+    const allowedHosts = this.env.gatewayAllowedHosts ?? [];
+    if (allowedHosts.length > 0 && !allowedHosts.includes(upstream.host.toLowerCase())) {
+      throw invalid('مقصد سرویس بالادست در فهرست مجاز درگاه نیست.');
     }
     const realms = [...new Set(input.allowedRealms)];
     if (realms.length === 0 || realms.some((realm) => !REALMS.includes(realm as PrincipalEntity['realm']))) {

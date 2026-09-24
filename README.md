@@ -21,6 +21,8 @@ npm run start                   # uses DATABASE_URL (runtime role)
 
 Health: `GET /health`. API docs: `GET /docs` (not served in production). Panel token keys: `GET /.well-known/jwks.json`.
 
+Production gateway forwarding also requires an exact `GATEWAY_ALLOWED_HOSTS` allowlist. Registered routes are policy; domain services remain responsible for business and tenant/object authorization.
+
 ## Tests
 
 ```bash

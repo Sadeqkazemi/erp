@@ -25,6 +25,7 @@
 - [x] Login CSRF, workload password login and TOTP replay are rejected — e2e `rejects login CSRF`
 - [x] Panel tokens are Ed25519, published via JWKS, and die with their session — e2e `signs panel tokens`, `src/common/crypto.spec.ts`
 - [x] Gateway decisions recheck active staff, panel and entitlement; admin can revoke an entitlement with an audit/outbox event, immediately denying previously issued tokens — `gateway-revocation.spec.ts`
+- [x] The data-plane forward endpoint now binds a request to a registered route ID, exact method and concrete versioned path; rechecks session/principal/panel/entitlement, applies a production host allowlist and route timeout, rejects redirects/encoded slashes/oversized payloads, strips cookies and unapproved headers, and preserves only safe response headers. Domain object authorization remains with the owning service (`platform-core.e2e-spec.ts`).
 - [x] Audit log is append-only in the database — e2e `keeps the audit log append-only`
 - [x] Audit read supports bounded page size, stable UTC timestamp/ID cursor, action/correlation/time filters and admin-only access — `audit-query.e2e-spec.ts`
 - [x] Parallel outbox dispatchers do not concurrently claim the same row — e2e `never dispatches the same outbox row twice`
