@@ -237,6 +237,13 @@ export class PlatformCoreController {
     return { success: true, data: { revoked: true } };
   }
 
+  @Get('v1/sessions/me')
+  @ApiOperation({ summary: 'هویت نشست جاری برای رابط کاربری مدیریت' })
+  async currentSession(@Req() req: AuthedRequest) {
+    const actor = await this.actor(req);
+    return { success: true, data: { id: actor.id, username: actor.username, realm: actor.realm, role: actor.role, tenantId: actor.tenantId } };
+  }
+
   @Post('v1/sessions/rotate')
   @ApiOperation({ summary: 'چرخش نشست پس از ورود یا تغییر امتیاز' })
   async rotate(@Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response) {
@@ -430,6 +437,8 @@ export class PlatformCoreController {
         objectType: row.objectType,
         objectId: row.objectId,
         correlationId: row.correlationId,
+        createdAt: row.createdAt,
+        actorPrincipalId: row.actorPrincipalId,
       })),
       page: { nextCursor },
     };

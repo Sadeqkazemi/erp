@@ -9,6 +9,7 @@ The core is a control plane. These routes do not create bookings, tickets, inven
 | GET | `/health` | public | Database ping |
 | GET | `/.well-known/jwks.json` | public | Ed25519 public key that verifies panel tokens |
 | POST | `/v1/sessions` | public, throttled (10/min), Origin checked when sent | Staff login requires password and a single-use TOTP. `WORKLOAD` cannot log in with a password. Sets host-only session cookie |
+| GET | `/v1/sessions/me` | active session | Current principal ID, username, realm, role and tenant ID for the management UI; no secrets |
 | POST | `/v1/sessions/logout` | session + CSRF + Origin | Revoke session |
 | POST | `/v1/sessions/rotate` | session + CSRF + Origin | Rotate session and CSRF token |
 | GET | `/v1/panels` | session | Panels the caller is entitled to. Empty list when none |
@@ -27,7 +28,7 @@ The core is a control plane. These routes do not create bookings, tickets, inven
 | GET | `/v1/consents/me` | session | Optional cookies default to denied |
 | POST | `/v1/visitor-consents` | Origin, rate limit; anonymous | Record optional cookie grant or withdrawal, set opaque HttpOnly visitor cookie |
 | GET | `/v1/visitor-consents/me` | anonymous visitor cookie | Latest optional cookie decisions; both denied when absent |
-| GET | `/v1/audit-events` | platform admin | Append-only control-plane audit (enforced by a database trigger), with optional `limit` (1–100), `cursor`, `action`, `correlationId`, `from`, `to` query parameters. Existing `data` array is retained; `page.nextCursor` is null at the end |
+| GET | `/v1/audit-events` | platform admin | Append-only control-plane audit (enforced by a database trigger), with optional `limit` (1–100), `cursor`, `action`, `correlationId`, `from`, `to` query parameters. Existing `data` array includes `createdAt` and `actorPrincipalId`; `page.nextCursor` is null at the end |
 | GET | `/v1/control-plane/summary` | platform admin | Actual counts of panels, route contracts, workflow statuses, pending/retried outbox events, oldest pending age and seven UTC days of audit counts. `domainSales.status=UNCONFIGURED` until the owning service is integrated |
 | GET | `/v1/outbox/dead-letters` | platform admin | Last 100 halted outbox events and failure details, with no event payload |
 | POST | `/v1/outbox/dead-letters/:id/requeue` | platform admin + CSRF + Origin | Audited replay after investigating a failed event; preserves its event ID |
