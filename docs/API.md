@@ -21,6 +21,8 @@ The core is a control plane. These routes do not create bookings, tickets, inven
 | POST | `/v1/gateway/routes/:id/probe` | platform admin + CSRF + Origin | Upstream timeout stays inside the gateway call. Core health stays up. Redirects are not followed |
 | POST | `/v1/workflow-runs` | staff + CSRF + Origin + idempotency key | Start workflow engine state only |
 | POST | `/v1/workflow-runs/:id/transitions` | run starter or platform admin + CSRF + Origin | Legal engine transitions only, serialised per run |
+| POST | `/v1/workflow-runs/:id/steps` | run starter or platform admin + CSRF + Origin + idempotency key | Create a unique step with `{stepKey,timeoutSeconds}` and persisted UTC deadline; run must be active |
+| POST | `/v1/workflow-runs/:id/steps/:stepKey/transitions` | run starter or platform admin + CSRF + Origin | Record step status (`PENDING→RUNNING→SUCCEEDED`, or failure/compensation). Execution remains in the owning service |
 | POST | `/v1/consents` | session + CSRF + Origin | Record analytics or advertising grant/withdrawal |
 | GET | `/v1/consents/me` | session | Optional cookies default to denied |
 | POST | `/v1/visitor-consents` | Origin, rate limit; anonymous | Record optional cookie grant or withdrawal, set opaque HttpOnly visitor cookie |
@@ -28,6 +30,8 @@ The core is a control plane. These routes do not create bookings, tickets, inven
 | GET | `/v1/audit-events` | platform admin | Append-only control-plane audit (enforced by a database trigger) |
 
 Agency login at `POST /v1/sessions` requires `tenantId` (UUID). The username is looked up within that tenant; staff and customer sessions must omit `tenantId`.
+
+Workflow step deadlines are checked periodically. Expired pending/running steps become failed; runs with successful sibling steps enter `COMPENSATING`, otherwise `FAILED`. A compensated run requires each step to be either compensated or failed. Core stores orchestration state only. Domain services own business state, side effects and compensation evidence.
 
 Idempotency keys: header `Idempotency-Key`, 8–128 characters of `[A-Za-z0-9_-]`, scoped to the caller and the operation. The same key with a different body returns `409 IDEMPOTENCY_PAYLOAD_MISMATCH`.
 

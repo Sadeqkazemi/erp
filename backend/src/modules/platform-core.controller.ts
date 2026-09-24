@@ -7,6 +7,7 @@ import { ErrorCode } from '../common/errors';
 import { csrfCookieName, randomToken } from '../common/crypto';
 import { AuthenticatedPrincipal, PlatformCoreService } from './platform-core.service';
 import { WorkflowStatus, WORKFLOW_STATUSES } from './workflow/workflow-transitions';
+import { STEP_STATUSES, StepStatus } from './workflow/step-transitions';
 
 class LoginDto {
   @ApiProperty({ example: 'STAFF', enum: ['STAFF', 'CUSTOMER', 'AGENCY', 'WORKLOAD'] })
@@ -107,6 +108,24 @@ class TransitionWorkflowDto {
   @ApiProperty({ example: 'RUNNING', enum: WORKFLOW_STATUSES })
   @IsIn(WORKFLOW_STATUSES)
   to!: WorkflowStatus;
+}
+
+class CreateWorkflowStepDto {
+  @ApiProperty({ example: 'reserve-inventory' })
+  @Matches(/^[a-z][a-z0-9-]{1,62}$/)
+  stepKey!: string;
+
+  @ApiProperty({ example: 300 })
+  @IsInt()
+  @Min(1)
+  @Max(604800)
+  timeoutSeconds!: number;
+}
+
+class TransitionWorkflowStepDto {
+  @ApiProperty({ enum: STEP_STATUSES, example: 'RUNNING' })
+  @IsIn(STEP_STATUSES)
+  to!: StepStatus;
 }
 
 class ConsentDto {
@@ -301,6 +320,31 @@ export class PlatformCoreController {
     const actor = await this.requireMutation(req);
     const run = await this.core.transitionWorkflow(actor, id, dto.to, this.correlation(req));
     return { success: true, data: { id: run.id, status: run.status } };
+  }
+
+  @Post('v1/workflow-runs/:id/steps')
+  @ApiOperation({ summary: 'ثبت گام پایدار گردش‌کار با مهلت اجرا' })
+  async createStep(
+    @Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: CreateWorkflowStepDto, @Headers('idempotency-key') key?: string,
+  ) {
+    const actor = await this.requireMutation(req);
+    const step = await this.core.createWorkflowStep(actor, id, dto, this.idempotencyKey(key), this.correlation(req));
+    return { success: true, data: step };
+  }
+
+  @Post('v1/workflow-runs/:id/steps/:stepKey/transitions')
+  @ApiOperation({ summary: 'ثبت نتیجه گام یا جبران آن بدون ذخیره داده کسب‌وکار' })
+  async transitionStep(
+    @Req() req: AuthedRequest, @Param('id', ParseUUIDPipe) id: string,
+    @Param('stepKey') stepKey: string, @Body() dto: TransitionWorkflowStepDto,
+  ) {
+    if (!/^[a-z][a-z0-9-]{1,62}$/.test(stepKey)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'کلید گام نامعتبر است.' });
+    }
+    const actor = await this.requireMutation(req);
+    const step = await this.core.transitionWorkflowStep(actor, id, stepKey, dto.to, this.correlation(req));
+    return { success: true, data: { id: step.id, stepKey: step.stepKey, status: step.status } };
   }
 
   @Post('v1/consents')

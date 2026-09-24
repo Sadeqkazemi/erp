@@ -40,7 +40,13 @@ async function bootstrap(): Promise<void> {
       process.stderr.write(`Outbox dispatch failed: ${error instanceof Error ? error.message : String(error)}\n`);
     });
   }, 5000);
+  const workflowTimer = setInterval(() => {
+    void core.expireWorkflowSteps().catch((error: unknown) => {
+      process.stderr.write(`Workflow timer failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    });
+  }, 5000);
   app.getHttpServer().on('close', () => clearInterval(dispatchTimer));
+  app.getHttpServer().on('close', () => clearInterval(workflowTimer));
 }
 
 void bootstrap();

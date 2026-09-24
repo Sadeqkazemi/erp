@@ -10,12 +10,14 @@ import {
   RouteContractEntity,
   SessionEntity,
   WorkflowRunEntity,
+  WorkflowStepEntity,
   VisitorConsentEntity,
 } from './entities';
 import { PlatformCoreFoundation1710000000000 } from './migrations/1710000000000-PlatformCoreFoundation';
 import { PlatformCoreHardening1710000000001 } from './migrations/1710000000001-PlatformCoreHardening';
 import { VisitorConsent1710000000002 } from './migrations/1710000000002-VisitorConsent';
 import { AgencyTenant1710000000003 } from './migrations/1710000000003-AgencyTenant';
+import { WorkflowSteps1710000000004 } from './migrations/1710000000004-WorkflowSteps';
 
 export const coreEntities = [
   PrincipalEntity,
@@ -24,6 +26,7 @@ export const coreEntities = [
   EntitlementEntity,
   RouteContractEntity,
   WorkflowRunEntity,
+  WorkflowStepEntity,
   AuditEventEntity,
   OutboxEventEntity,
   ConsentRecordEntity,
@@ -39,7 +42,7 @@ export function createDataSource(databaseUrl = process.env.DATABASE_URL): DataSo
     type: 'postgres',
     url: databaseUrl,
     entities: coreEntities,
-    migrations: [PlatformCoreFoundation1710000000000, PlatformCoreHardening1710000000001, VisitorConsent1710000000002, AgencyTenant1710000000003],
+    migrations: [PlatformCoreFoundation1710000000000, PlatformCoreHardening1710000000001, VisitorConsent1710000000002, AgencyTenant1710000000003, WorkflowSteps1710000000004],
     synchronize: false,
   });
 }

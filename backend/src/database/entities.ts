@@ -183,6 +183,34 @@ export class WorkflowRunEntity {
   updatedAt!: Date;
 }
 
+@Entity({ name: 'workflow_steps' })
+@Index(['workflowRunId', 'stepKey'], { unique: true })
+export class WorkflowStepEntity {
+  @PrimaryColumn('uuid')
+  id!: string;
+
+  @Column('uuid')
+  workflowRunId!: string;
+
+  @Column({ type: 'varchar' })
+  stepKey!: string;
+
+  @Column({ type: 'varchar' })
+  status!: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'COMPENSATING' | 'COMPENSATED';
+
+  @Column({ type: 'int', default: 0 })
+  attempt!: number;
+
+  @Column({ type: 'timestamptz' })
+  deadlineAt!: Date;
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  createdAt!: Date;
+
+  @UpdateDateColumn({ type: 'timestamptz' })
+  updatedAt!: Date;
+}
+
 @Entity({ name: 'audit_events' })
 export class AuditEventEntity {
   @PrimaryColumn('uuid')

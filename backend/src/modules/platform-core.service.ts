@@ -1,5 +1,5 @@
 import { BadRequestException, ConflictException, ForbiddenException, Inject, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
-import { DataSource, EntityManager, In } from 'typeorm';
+import { DataSource, EntityManager, In, LessThanOrEqual } from 'typeorm';
 import { randomUUID } from 'crypto';
 import * as argon2 from 'argon2';
 import { ErrorCode } from '../common/errors';
@@ -30,9 +30,11 @@ import {
   RouteContractEntity,
   SessionEntity,
   WorkflowRunEntity,
+  WorkflowStepEntity,
   VisitorConsentEntity,
 } from '../database/entities';
 import { assertWorkflowTransition, WorkflowStatus } from './workflow/workflow-transitions';
+import { assertStepTransition, StepStatus } from './workflow/step-transitions';
 
 export interface AuthenticatedPrincipal {
   id: string;
@@ -608,12 +610,7 @@ export class PlatformCoreService {
       if (!run) {
         throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'اجرای گردش‌کار یافت نشد.' });
       }
-      if (run.startedByPrincipalId !== actor.id && actor.role !== 'PLATFORM_ADMIN') {
-        throw new ForbiddenException({
-          code: ErrorCode.FORBIDDEN,
-          message: 'فقط آغازکننده یا مدیر سکو می‌تواند وضعیت این گردش‌کار را تغییر دهد.',
-        });
-      }
+      this.assertWorkflowActor(actor, run);
       try {
         assertWorkflowTransition(run.status, to);
       } catch {
@@ -621,6 +618,21 @@ export class PlatformCoreService {
           code: ErrorCode.ILLEGAL_TRANSITION,
           message: 'این تغییر وضعیت گردش‌کار مجاز نیست.',
         });
+      }
+      if (to === 'COMPLETED' || to === 'COMPENSATED') {
+        const steps = await manager.find(WorkflowStepEntity, { where: { workflowRunId: run.id } });
+        const done = to === 'COMPLETED'
+          ? steps.every((step) => step.status === 'SUCCEEDED')
+          : steps.every((step) => step.status === 'COMPENSATED' || step.status === 'FAILED');
+        if (!done) {
+          throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'گام‌های گردش‌کار هنوز نهایی نشده‌اند.' });
+        }
+      }
+      if (to === 'FAILED') {
+        const successful = await manager.findOne(WorkflowStepEntity, { where: { workflowRunId: run.id, status: 'SUCCEEDED' } });
+        if (successful) {
+          throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'گام‌های موفق باید ابتدا جبران شوند.' });
+        }
       }
       const from = run.status;
       run.status = to;
@@ -637,6 +649,116 @@ export class PlatformCoreService {
       });
       return run;
     });
+  }
+
+  async createWorkflowStep(
+    actor: AuthenticatedPrincipal, workflowRunId: string,
+    input: { stepKey: string; timeoutSeconds: number }, idempotencyKey: string, correlationId: string,
+  ): Promise<{ id: string; stepKey: string; status: StepStatus; deadlineAt: string }> {
+    this.requireStaff(actor);
+    return this.dataSource.transaction(async (manager) => {
+      const run = await manager.findOne(WorkflowRunEntity, { where: { id: workflowRunId }, lock: { mode: 'pessimistic_write' } });
+      if (!run) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'اجرای گردش‌کار یافت نشد.' });
+      this.assertWorkflowActor(actor, run);
+      if (run.status !== 'RUNNING' && run.status !== 'WAITING') {
+        throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'اجرای گردش‌کار آماده ثبت گام نیست.' });
+      }
+      return this.idempotent(manager, actor.id, `workflow.step.${workflowRunId}`, idempotencyKey, input, async () => {
+        const existing = await manager.findOne(WorkflowStepEntity, { where: { workflowRunId, stepKey: input.stepKey } });
+        if (existing) throw new ConflictException({ code: ErrorCode.CONFLICT, message: 'این گام قبلاً ثبت شده است.' });
+        const step = manager.create(WorkflowStepEntity, {
+          id: randomUUID(), workflowRunId, stepKey: input.stepKey, status: 'PENDING' as const,
+          attempt: 0, deadlineAt: new Date(Date.now() + input.timeoutSeconds * 1000),
+        });
+        await manager.save(step);
+        await this.appendControl(manager, {
+          actorId: actor.id, action: 'workflow.step.created', objectType: 'workflow_step', objectId: step.id,
+          correlationId, eventName: 'core.workflow.step.created.v1',
+          payload: { workflowRunId, stepId: step.id, stepKey: step.stepKey },
+        });
+        return { id: step.id, stepKey: step.stepKey, status: step.status, deadlineAt: step.deadlineAt.toISOString() };
+      });
+    });
+  }
+
+  async transitionWorkflowStep(
+    actor: AuthenticatedPrincipal, workflowRunId: string, stepKey: string, to: StepStatus, correlationId: string,
+  ): Promise<WorkflowStepEntity> {
+    this.requireStaff(actor);
+    return this.dataSource.transaction(async (manager) => {
+      const run = await manager.findOne(WorkflowRunEntity, { where: { id: workflowRunId }, lock: { mode: 'pessimistic_write' } });
+      if (!run) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'اجرای گردش‌کار یافت نشد.' });
+      this.assertWorkflowActor(actor, run);
+      const step = await manager.findOne(WorkflowStepEntity, {
+        where: { workflowRunId, stepKey }, lock: { mode: 'pessimistic_write' },
+      });
+      if (!step) throw new NotFoundException({ code: ErrorCode.NOT_FOUND, message: 'گام گردش‌کار یافت نشد.' });
+      try {
+        assertStepTransition(step.status, to);
+      } catch {
+        throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'تغییر وضعیت گام مجاز نیست.' });
+      }
+      if (['PENDING', 'RUNNING'].includes(step.status) && step.deadlineAt.getTime() <= Date.now()) {
+        throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'مهلت گام به پایان رسیده است.' });
+      }
+      if ((to === 'COMPENSATING' || to === 'COMPENSATED') && run.status !== 'COMPENSATING') {
+        throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'اجرای گردش‌کار در وضعیت جبران نیست.' });
+      }
+      if (to !== 'COMPENSATING' && to !== 'COMPENSATED' && run.status !== 'RUNNING' && run.status !== 'WAITING') {
+        throw new ConflictException({ code: ErrorCode.ILLEGAL_TRANSITION, message: 'اجرای گردش‌کار فعال نیست.' });
+      }
+      const from = step.status;
+      step.status = to;
+      step.attempt += 1;
+      await manager.save(step);
+      await this.appendControl(manager, {
+        actorId: actor.id, action: 'workflow.step.transitioned', objectType: 'workflow_step', objectId: step.id,
+        correlationId, eventName: 'core.workflow.step.transitioned.v1',
+        payload: { workflowRunId, stepId: step.id, from, status: to },
+      });
+      return step;
+    });
+  }
+
+  async expireWorkflowSteps(): Promise<number> {
+    const candidates = await this.dataSource.getRepository(WorkflowStepEntity).find({
+      where: { status: In(['PENDING', 'RUNNING']), deadlineAt: LessThanOrEqual(new Date()) },
+      order: { deadlineAt: 'ASC' }, take: 50,
+    });
+    let count = 0;
+    for (const candidate of candidates) {
+      const expired = await this.dataSource.transaction(async (manager) => {
+        // Always lock the run before the step, matching manual transition lock order.
+        const run = await manager.findOne(WorkflowRunEntity, {
+          where: { id: candidate.workflowRunId }, lock: { mode: 'pessimistic_write' },
+        });
+        if (!run) return false;
+        const step = await manager.findOne(WorkflowStepEntity, { where: { id: candidate.id }, lock: { mode: 'pessimistic_write' } });
+        if (!step || !['PENDING', 'RUNNING'].includes(step.status) || step.deadlineAt.getTime() > Date.now()) return false;
+        step.status = 'FAILED';
+        step.attempt += 1;
+        await manager.save(step);
+        if (run.status === 'RUNNING' || run.status === 'WAITING') {
+          const success = await manager.findOne(WorkflowStepEntity, { where: { workflowRunId: run.id, status: 'SUCCEEDED' } });
+          run.status = success ? 'COMPENSATING' : 'FAILED';
+          await manager.save(run);
+        }
+        await this.appendControl(manager, {
+          actorId: null, action: 'workflow.step.expired', objectType: 'workflow_step', objectId: step.id,
+          correlationId: run.correlationId, eventName: 'core.workflow.step.expired.v1',
+          payload: { workflowRunId: run.id, stepId: step.id, status: 'FAILED' },
+        });
+        return true;
+      });
+      if (expired) count += 1;
+    }
+    return count;
+  }
+
+  private assertWorkflowActor(actor: AuthenticatedPrincipal, run: WorkflowRunEntity): void {
+    if (run.startedByPrincipalId !== actor.id && actor.role !== 'PLATFORM_ADMIN') {
+      throw new ForbiddenException({ code: ErrorCode.FORBIDDEN, message: 'فقط آغازکننده یا مدیر سکو می‌تواند گردش‌کار را تغییر دهد.' });
+    }
   }
 
   async recordConsent(
