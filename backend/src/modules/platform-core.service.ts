@@ -842,6 +842,30 @@ export class PlatformCoreService {
     return this.dataSource.getRepository(AuditEventEntity).find({ order: { createdAt: 'DESC' }, take: 100 });
   }
 
+  async controlPlaneSummary(actor: AuthenticatedPrincipal) {
+    this.requirePlatformAdmin(actor);
+    const [panels, routes, workflows, outbox, dailyAudit] = await Promise.all([
+      this.dataSource.query(`SELECT count(*)::int AS total,
+        count(*) FILTER (WHERE status = 'ACTIVE')::int AS active FROM panels`),
+      this.dataSource.query('SELECT count(*)::int AS total FROM route_contracts'),
+      this.dataSource.query('SELECT status, count(*)::int AS count FROM workflow_runs GROUP BY status ORDER BY status'),
+      this.dataSource.query(`SELECT count(*)::int AS pending,
+        count(*) FILTER (WHERE attempts > 0)::int AS retried,
+        extract(epoch FROM (now() - min("createdAt")))::int AS "oldestAgeSeconds"
+        FROM outbox_events WHERE "publishedAt" IS NULL`),
+      this.dataSource.query(`SELECT to_char(date_trunc('day', "createdAt" AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
+        count(*)::int AS count FROM audit_events
+        WHERE "createdAt" >= date_trunc('day', now() AT TIME ZONE 'UTC') - interval '6 days'
+        GROUP BY day ORDER BY day`),
+    ]);
+    return {
+      asOf: new Date().toISOString(),
+      panels: panels[0], routes: routes[0], workflows,
+      outbox: outbox[0], auditLastSevenUtcDays: dailyAudit,
+      domainSales: { status: 'UNCONFIGURED' },
+    };
+  }
+
   /**
    * Claims a batch with SKIP LOCKED so parallel dispatchers never deliver the same row twice,
    * marks each row published only after the publisher accepts it, and records failures for retry.

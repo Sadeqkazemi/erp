@@ -403,6 +403,13 @@ export class PlatformCoreController {
     };
   }
 
+  @Get('v1/control-plane/summary')
+  @ApiOperation({ summary: 'آمار واقعی هسته بدون ادعای دادهٔ فروش سرویس‌های دامنه' })
+  async controlPlaneSummary(@Req() req: AuthedRequest) {
+    const actor = await this.actor(req);
+    return { success: true, data: await this.core.controlPlaneSummary(actor) };
+  }
+
   private async actor(req: AuthedRequest): Promise<AuthenticatedPrincipal> {
     const token = this.sessionToken(req);
     return this.core.authenticate(token);

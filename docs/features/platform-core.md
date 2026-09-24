@@ -27,6 +27,7 @@
 - [x] Audit log is append-only in the database — e2e `keeps the audit log append-only`
 - [x] Parallel outbox dispatchers do not concurrently claim the same row — e2e `never dispatches the same outbox row twice`
 - [x] The publisher retains unacknowledged rows on broker errors and retries after recovery — e2e `keeps unacknowledged events pending`
+- [x] Admin-only control-plane summary reports real panel/workflow/audit/outbox counts; domain sales is explicitly unconfigured until its owning API exists.
 - [x] Migrations run only with the migration role; CI tests as the least-privilege runtime role — `.github/workflows/ci.yml`
 - [x] NestJS 11 (Express 5); `npm audit` reports no advisories and CI fails on any high or critical finding — `.github/workflows/ci.yml`
 
