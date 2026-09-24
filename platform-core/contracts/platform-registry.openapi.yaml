@@ -1,0 +1,103 @@
+openapi: 3.1.0
+info:
+  title: BlueJet Platform Panel Registry
+  version: 1.0.0
+  description: Control plane catalog only. Domain records remain in owning services.
+servers:
+  - url: https://platform-core.example.invalid
+security:
+  - oidc: []
+paths:
+  /health/live:
+    get:
+      operationId: liveness
+      security: []
+      responses:
+        '200':
+          description: Process is serving requests; does not prove database readiness.
+  /v1/platform/panels:
+    get:
+      operationId: listPanels
+      description: Requires panel.read scope. Results are filtered by the verified tenant_id claim.
+      responses:
+        '200':
+          description: Tenant-scoped panel catalog
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, requestId]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Panel' }
+                  requestId: { type: string, format: uuid }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      operationId: registerPanel
+      description: Requires panel.write scope and platform-admin role; write, receipt and audit are one database transaction.
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: { type: string, minLength: 16, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NewPanel' }
+      responses:
+        '201':
+          description: Registered
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PanelResult' }
+        '200':
+          description: Exact idempotent replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PanelResult' }
+        '400': { description: Invalid input or missing idempotency key }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: Panel exists or idempotency key reused with different input }
+        '422': { description: Site Admin must belong to Employees }
+        '503': { description: Store unavailable; retry only with the same idempotency key }
+components:
+  securitySchemes:
+    oidc:
+      type: openIdConnect
+      openIdConnectUrl: https://identity.example.invalid/.well-known/openid-configuration
+  responses:
+    Unauthorized:
+      description: Missing or invalid signed token
+    Forbidden:
+      description: Insufficient role or scope
+  schemas:
+    NewPanel:
+      type: object
+      required: [key, nameFa, nameEn, group, ownerService, requiredScopes]
+      additionalProperties: false
+      properties:
+        key: { type: string, pattern: '^[a-z][a-z0-9-]{2,62}$' }
+        nameFa: { type: string, minLength: 1, maxLength: 120 }
+        nameEn: { type: string, minLength: 1, maxLength: 120 }
+        group: { type: string, enum: [management, operations, employees] }
+        ownerService: { type: string, pattern: '^[a-z][a-z0-9-]{2,62}$' }
+        requiredScopes:
+          type: array
+          maxItems: 30
+          items: { type: string, pattern: '^[a-z][a-z0-9-]{2,62}$' }
+    Panel:
+      allOf:
+        - { $ref: '#/components/schemas/NewPanel' }
+        - type: object
+          properties:
+            version: { type: integer, minimum: 1 }
+    PanelResult:
+      type: object
+      required: [panel, requestId]
+      properties:
+        panel: { $ref: '#/components/schemas/Panel' }
+        requestId: { type: string, format: uuid }
