@@ -40,3 +40,30 @@ jobs:
             platform-core-sbom.json
           if-no-files-found: error
           retention-days: 30
+
+  attest-main:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: platform-core-artifact
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      # actions/download-artifact v8.0.0 and actions/attest v4.2.1, pinned to immutable commits.
+      - uses: actions/download-artifact@974686ed5098c7f9c9289ec946b9058e496a2561
+        with:
+          name: platform-core-build-${{ github.sha }}
+          path: attested
+      - name: Verify downloaded artifact bytes
+        working-directory: attested
+        run: sha256sum -c platform-core-build.sha256
+      - name: Attest build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d
+        with:
+          subject-path: attested/platform-core-build.tgz
+      - name: Attest CycloneDX SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d
+        with:
+          subject-path: attested/platform-core-build.tgz
+          sbom-path: attested/platform-core-sbom.json
