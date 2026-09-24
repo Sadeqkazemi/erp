@@ -198,6 +198,19 @@ class AuditQueryDto {
   to?: string;
 }
 
+class ServiceQueryDto {
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit?: number;
+
+  @IsOptional()
+  @Matches(/^[a-z][a-z0-9-]{1,62}$/)
+  cursor?: string;
+}
+
 class RegisterRouteDto {
   @ApiProperty({ example: 'GET' })
   @IsString()
@@ -482,6 +495,14 @@ export class PlatformCoreController {
   async controlPlaneSummary(@Req() req: AuthedRequest) {
     const actor = await this.actor(req);
     return { success: true, data: await this.core.controlPlaneSummary(actor) };
+  }
+
+  @Get('v1/control-plane/services')
+  @ApiOperation({ summary: 'مالک سرویس‌های ثبت‌شده، بدون ادعای تله‌متری زنده' })
+  async registeredServices(@Req() req: AuthedRequest, @Query() query: ServiceQueryDto) {
+    const actor = await this.actor(req);
+    const result = await this.core.listRegisteredServices(actor, query.limit, query.cursor);
+    return { success: true, data: { asOf: result.asOf, services: result.services }, page: { nextCursor: result.nextCursor } };
   }
 
   @Get('v1/outbox/dead-letters')

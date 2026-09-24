@@ -566,10 +566,9 @@ export class PlatformCoreService {
     }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), route.timeoutMs);
+    let response: Response;
     try {
-      const response = await fetch(route.upstreamBaseUrl, { method: 'GET', redirect: 'manual', signal: controller.signal });
-      await response.body?.cancel();
-      return { isolated: true };
+      response = await fetch(route.upstreamBaseUrl, { method: 'GET', redirect: 'manual', signal: controller.signal });
     } catch {
       throw new ConflictException({
         code: ErrorCode.UPSTREAM_TIMEOUT,
@@ -578,6 +577,11 @@ export class PlatformCoreService {
     } finally {
       clearTimeout(timer);
     }
+    await response.body?.cancel();
+    if (!response.ok) {
+      throw new ConflictException({ code: ErrorCode.CONFLICT, message: 'سرویس بالادست پاسخ سالم نداد.' });
+    }
+    return { isolated: true };
   }
 
   async startWorkflow(
@@ -958,6 +962,23 @@ export class PlatformCoreService {
       panels: panels[0], routes: routes[0], workflows,
       outbox: outbox[0], auditLastSevenUtcDays: dailyAudit,
       domainSales: { status: 'UNCONFIGURED' },
+    };
+  }
+
+  async listRegisteredServices(actor: AuthenticatedPrincipal, limit = 100, cursor?: string) {
+    this.requirePlatformAdmin(actor);
+    const rows = await this.dataSource.query(`SELECT p."ownerService" AS "ownerService",
+      count(DISTINCT p.id)::int AS "activePanels", count(DISTINCT r.id)::int AS "registeredRoutes"
+      FROM panels p LEFT JOIN route_contracts r ON r.audience = p.audience
+      WHERE p.status = 'ACTIVE' AND ($1::varchar IS NULL OR p."ownerService" > $1)
+      GROUP BY p."ownerService" ORDER BY p."ownerService" LIMIT $2`, [cursor ?? null, limit + 1]) as Array<{
+      ownerService: string; activePanels: number; registeredRoutes: number;
+    }>;
+    const page = rows.slice(0, limit);
+    return {
+      asOf: new Date().toISOString(),
+      services: page.map((row) => ({ ...row, health: 'UNKNOWN' as const, lastObservedAt: null })),
+      nextCursor: rows.length > limit ? page.at(-1)?.ownerService ?? null : null,
     };
   }
 

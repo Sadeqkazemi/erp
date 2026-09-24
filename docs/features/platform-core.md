@@ -30,6 +30,7 @@
 - [x] The publisher retains unacknowledged rows on broker errors and retries after recovery — e2e `keeps unacknowledged events pending`
 - [x] Bounded retry and durable dead-letter state after eight failures, admin-only inspection and audited replay with the same event ID — `outbox-recovery.e2e-spec.ts`
 - [x] Admin-only control-plane summary reports real panel/workflow/audit/outbox counts; domain sales is explicitly unconfigured until its owning API exists.
+- [x] Admin-only paged service catalog derives actual active panel owners and registered route counts from the core registry, without claiming live service health. HTTP 5xx probes are reported as unsuccessful (`service-catalog.spec.ts`).
 - [x] Versioned workflow definition registry stores owner, allowed steps and their deadlines. Production refuses unregistered runs, wrong owners and unapproved steps/timeouts; existing nonproduction tests can still create legacy ad hoc runs. Registration is immutable and audited (`workflow-definitions.spec.ts`). Domain callbacks and compensation remain separate work.
 - [x] Migrations run only with the migration role; CI tests as the least-privilege runtime role — `.github/workflows/ci.yml`
 - [x] NestJS 11 (Express 5); `npm audit` reports no advisories and CI fails on any high or critical finding — `.github/workflows/ci.yml`
