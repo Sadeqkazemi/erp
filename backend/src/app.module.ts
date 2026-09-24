@@ -51,6 +51,6 @@ export class AppModule implements NestModule {
         res.setHeader('X-Request-Id', requestId);
         next();
       })
-      .forRoutes('*');
+      .forRoutes('{*splat}');
   }
 }
