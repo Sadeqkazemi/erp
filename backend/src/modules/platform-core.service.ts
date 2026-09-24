@@ -66,7 +66,8 @@ export interface PublishedEvent {
 
 @Injectable()
 export class PlatformCoreService {
-  private readonly published: PublishedEvent[] = [];
+  // Observability snapshot for tests; broker acceptance, not this list, determines delivery.
+  private readonly acceptedEvents: PublishedEvent[] = [];
   private dummyPasswordHash: Promise<string> | null = null;
 
   constructor(
@@ -630,7 +631,8 @@ export class PlatformCoreService {
   /**
    * Claims a batch with SKIP LOCKED so parallel dispatchers never deliver the same row twice,
    * marks each row published only after the publisher accepts it, and records failures for retry.
-   * The in-process publisher stands in for the broker until one is provisioned.
+   * Broker ingress must durably accept an event before the database row is acknowledged.
+   * Consumers deduplicate by eventId if delivery succeeds but the DB commit fails.
    */
   async dispatchOutbox(): Promise<number> {
     return this.dataSource.transaction(async (manager) => {
@@ -645,7 +647,7 @@ export class PlatformCoreService {
       let count = 0;
       for (const event of pending) {
         try {
-          this.publish({
+          await this.publish({
             eventId: event.eventId,
             eventName: event.eventName,
             aggregateId: event.aggregateId,
@@ -664,14 +666,33 @@ export class PlatformCoreService {
     });
   }
 
-  private publish(event: PublishedEvent): void {
-    if (!this.published.some((item) => item.eventId === event.eventId)) {
-      this.published.push(event);
+  private async publish(event: PublishedEvent): Promise<void> {
+    if (!this.env.outboxPublishUrl) {
+      if (this.env.nodeEnv === 'test') {
+        this.acceptedEvents.push(event);
+        return;
+      }
+      throw new Error('OUTBOX_PUBLISH_URL is not configured');
     }
+    const response = await fetch(this.env.outboxPublishUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': event.eventId,
+        ...(this.env.outboxPublishToken ? { authorization: `Bearer ${this.env.outboxPublishToken}` } : {}),
+      },
+      body: JSON.stringify(event),
+      signal: AbortSignal.timeout(5000),
+    });
+    await response.body?.cancel();
+    if (!response.ok) {
+      throw new Error(`Broker ingress rejected event: HTTP ${response.status}`);
+    }
+    this.acceptedEvents.push(event);
   }
 
   publishedEvents(): PublishedEvent[] {
-    return [...this.published];
+    return [...this.acceptedEvents];
   }
 
   private dummyHash(): Promise<string> {

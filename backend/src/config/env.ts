@@ -15,6 +15,8 @@ export interface CoreEnv {
   allowedOrigins: string[];
   allowTestBootstrap: boolean;
   exposeApiDocs: boolean;
+  outboxPublishUrl: string | null;
+  outboxPublishToken: string | null;
 }
 
 function parseBoolean(source: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
@@ -71,6 +73,14 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): CoreEnv {
   if (production && origins.some((origin) => !origin.startsWith('https://'))) {
     throw new Error('ALLOWED_ORIGINS must use https in production');
   }
+  const outboxPublishUrl = source.OUTBOX_PUBLISH_URL?.trim() || null;
+  const outboxPublishToken = source.OUTBOX_PUBLISH_TOKEN?.trim() || null;
+  if (outboxPublishUrl && (!/^https?:\/\//.test(outboxPublishUrl) || (production && !outboxPublishUrl.startsWith('https://')))) {
+    throw new Error('OUTBOX_PUBLISH_URL must be an HTTP endpoint (HTTPS in production)');
+  }
+  if (production && (!outboxPublishUrl || !outboxPublishToken)) {
+    throw new Error('OUTBOX_PUBLISH_URL and OUTBOX_PUBLISH_TOKEN are required in production');
+  }
   return {
     nodeEnv,
     port: parsePositiveInt(source, 'PORT', 3000),
@@ -84,6 +94,8 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): CoreEnv {
     allowedOrigins: origins,
     allowTestBootstrap,
     exposeApiDocs,
+    outboxPublishUrl,
+    outboxPublishToken,
   };
 }
 
