@@ -29,11 +29,11 @@ describe('durable outbox ingress', () => {
     expect(request).toHaveBeenCalledTimes(1);
   });
 
-  it('uses the event ID as an idempotency key and accepts a durable acknowledgment', async () => {
+  it('uses the event ID as an idempotency key without retaining payloads in production memory', async () => {
     const request = jest.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 202 }));
     const core = publisher({});
     await core.publish(event);
-    expect(core.publishedEvents()).toHaveLength(1);
+    expect(core.publishedEvents()).toHaveLength(0);
     expect(request).toHaveBeenCalledWith('https://broker.internal/events', expect.objectContaining({
       headers: expect.objectContaining({ 'idempotency-key': event.eventId }),
     }));

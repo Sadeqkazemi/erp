@@ -743,7 +743,9 @@ export class PlatformCoreService {
     if (!response.ok) {
       throw new Error(`Broker ingress rejected event: HTTP ${response.status}`);
     }
-    this.acceptedEvents.push(event);
+    if (this.env.nodeEnv === 'test') {
+      this.acceptedEvents.push(event);
+    }
   }
 
   publishedEvents(): PublishedEvent[] {
