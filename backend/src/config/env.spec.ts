@@ -38,4 +38,10 @@ describe('workload identity environment', () => {
     excessive.WORKLOAD_TOKEN_MAX_TTL_SECONDS = '901';
     expect(() => loadEnv(excessive)).toThrow('between 30 and 900');
   });
+
+  it('rejects a weak telemetry bearer secret', () => {
+    const source = baseEnv();
+    source.METRICS_BEARER_TOKEN = 'too-short';
+    expect(() => loadEnv(source)).toThrow('at least 32 characters');
+  });
 });

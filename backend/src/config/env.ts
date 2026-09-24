@@ -22,6 +22,7 @@ export interface CoreEnv {
   gatewayMaxRequestBytes: number;
   gatewayMaxResponseBytes: number;
   workloadTokenVerifier: WorkloadTokenVerifier | null;
+  metricsBearerToken: string | null;
 }
 
 function parseBoolean(source: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
@@ -113,6 +114,13 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): CoreEnv {
   const workloadTokenVerifier = workloadJwks && workloadIssuer && workloadAudience
     ? loadWorkloadTokenVerifier(workloadJwks, workloadIssuer, workloadAudience, workloadMaxTtl)
     : null;
+  const metricsBearerToken = source.METRICS_BEARER_TOKEN?.trim() || null;
+  if (metricsBearerToken && metricsBearerToken.length < 32) {
+    throw new Error('METRICS_BEARER_TOKEN must contain at least 32 characters');
+  }
+  if (production && !metricsBearerToken) {
+    throw new Error('METRICS_BEARER_TOKEN is required in production');
+  }
   return {
     nodeEnv,
     port: parsePositiveInt(source, 'PORT', 3000),
@@ -133,6 +141,7 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): CoreEnv {
     gatewayMaxRequestBytes: parsePositiveInt(source, 'GATEWAY_MAX_REQUEST_BYTES', 262_144),
     gatewayMaxResponseBytes: parsePositiveInt(source, 'GATEWAY_MAX_RESPONSE_BYTES', 1_048_576),
     workloadTokenVerifier,
+    metricsBearerToken,
   };
 }
 
@@ -148,7 +157,8 @@ export function assertProductionSafe(env: CoreEnv): void {
   if (env.nodeEnv !== 'production') {
     return;
   }
-  if (!env.cookieSecure || env.allowTestBootstrap || env.exposeApiDocs || env.gatewayAllowedHosts.length === 0) {
+  if (!env.cookieSecure || env.allowTestBootstrap || env.exposeApiDocs || env.gatewayAllowedHosts.length === 0 ||
+    !env.metricsBearerToken) {
     throw new Error('Production cookie, bootstrap and API docs flags are unsafe');
   }
 }

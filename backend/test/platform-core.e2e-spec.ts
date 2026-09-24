@@ -138,6 +138,7 @@ describe('platform core', () => {
     process.env.WORKLOAD_TOKEN_ISSUER = 'https://identity.test';
     process.env.WORKLOAD_TOKEN_AUDIENCE = 'bluejet-platform-core';
     process.env.WORKLOAD_TOKEN_MAX_TTL_SECONDS = '300';
+    process.env.METRICS_BEARER_TOKEN = 'test-metrics-token-32-characters-minimum';
     process.env.MFA_ENCRYPTION_KEY = '11'.repeat(32);
     process.env.ALLOWED_ORIGINS = ORIGIN;
     process.env.SESSION_TTL_SECONDS = '900';
@@ -226,6 +227,17 @@ describe('platform core', () => {
       .send({ realm: 'STAFF', username: 'platform-admin', password: adminPassword })
       .expect(401);
     expect(response.body.error.code).toBe('INVALID_CREDENTIALS');
+  });
+
+  it('exposes no telemetry without the dedicated bearer and returns only control-plane metrics', async () => {
+    await request(app.getHttpServer()).get('/metrics').expect(401);
+    const response = await request(app.getHttpServer()).get('/metrics')
+      .set('Authorization', 'Bearer test-metrics-token-32-characters-minimum')
+      .expect(200);
+    expect(response.headers['content-type']).toContain('text/plain');
+    expect(response.text).toContain('bluejet_core_up 1');
+    expect(response.text).toContain('bluejet_core_outbox_events{state="pending"}');
+    expect(response.text).not.toMatch(/sales|booking|payment|passenger/i);
   });
 
   it('returns an empty launcher until another admin grants a panel', async () => {
