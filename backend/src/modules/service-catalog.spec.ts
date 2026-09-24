@@ -36,7 +36,7 @@ describe('registered service catalog', () => {
       ? { save } : { findOne: jest.fn().mockResolvedValue(route) } } as unknown as DataSource;
     const probeCore = new PlatformCoreService(db, {} as CoreEnv);
     const original = global.fetch;
-    global.fetch = jest.fn().mockResolvedValue({ ok: false, body: null }) as typeof fetch;
+    global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 503, body: null }) as typeof fetch;
     try {
       await expect(probeCore.probeUpstream(admin, route.id)).rejects.toMatchObject({ status: 409 });
       expect(save).toHaveBeenCalledWith(expect.objectContaining({ routeId: route.id, status: 'DOWN', httpStatus: 503, errorCode: 'HTTP_503' }));
