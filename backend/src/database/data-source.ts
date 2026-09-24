@@ -10,9 +10,11 @@ import {
   RouteContractEntity,
   SessionEntity,
   WorkflowRunEntity,
+  VisitorConsentEntity,
 } from './entities';
 import { PlatformCoreFoundation1710000000000 } from './migrations/1710000000000-PlatformCoreFoundation';
 import { PlatformCoreHardening1710000000001 } from './migrations/1710000000001-PlatformCoreHardening';
+import { VisitorConsent1710000000002 } from './migrations/1710000000002-VisitorConsent';
 
 export const coreEntities = [
   PrincipalEntity,
@@ -25,6 +27,7 @@ export const coreEntities = [
   OutboxEventEntity,
   ConsentRecordEntity,
   IdempotencyRecordEntity,
+  VisitorConsentEntity,
 ];
 
 export function createDataSource(databaseUrl = process.env.DATABASE_URL): DataSource {
@@ -35,7 +38,7 @@ export function createDataSource(databaseUrl = process.env.DATABASE_URL): DataSo
     type: 'postgres',
     url: databaseUrl,
     entities: coreEntities,
-    migrations: [PlatformCoreFoundation1710000000000, PlatformCoreHardening1710000000001],
+    migrations: [PlatformCoreFoundation1710000000000, PlatformCoreHardening1710000000001, VisitorConsent1710000000002],
     synchronize: false,
   });
 }

@@ -30,6 +30,7 @@ import {
   RouteContractEntity,
   SessionEntity,
   WorkflowRunEntity,
+  VisitorConsentEntity,
 } from '../database/entities';
 import { assertWorkflowTransition, WorkflowStatus } from './workflow/workflow-transitions';
 
@@ -623,6 +624,43 @@ export class PlatformCoreService {
     };
   }
 
+  async recordVisitorConsent(
+    visitorToken: string,
+    input: { purpose: 'ANALYTICS' | 'ADVERTISING'; policyVersion: string; decision: 'GRANTED' | 'WITHDRAWN' },
+    correlationId: string,
+  ): Promise<VisitorConsentEntity> {
+    if (!this.validVisitorToken(visitorToken)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'شناسه بازدیدکننده معتبر نیست.' });
+    }
+    return this.dataSource.transaction(async (manager) => {
+      const record = manager.create(VisitorConsentEntity, {
+        id: randomUUID(), visitorHash: sha256(visitorToken), ...input,
+      });
+      await manager.save(record);
+      await this.appendControl(manager, {
+        actorId: null, action: 'visitor.consent.recorded', objectType: 'visitor_consent',
+        objectId: record.id, correlationId, eventName: 'core.visitor.consent.recorded.v1',
+        payload: { consentId: record.id, purpose: input.purpose, decision: input.decision },
+      });
+      return record;
+    });
+  }
+
+  async visitorConsentSnapshot(visitorToken: string | undefined): Promise<{ analytics: boolean; advertising: boolean }> {
+    if (!visitorToken || !this.validVisitorToken(visitorToken)) {
+      return { analytics: false, advertising: false };
+    }
+    const rows = await this.dataSource.getRepository(VisitorConsentEntity).find({
+      where: { visitorHash: sha256(visitorToken) }, order: { recordedAt: 'DESC', id: 'DESC' },
+    });
+    const latest = (purpose: 'ANALYTICS' | 'ADVERTISING') => rows.find((row) => row.purpose === purpose);
+    return { analytics: latest('ANALYTICS')?.decision === 'GRANTED', advertising: latest('ADVERTISING')?.decision === 'GRANTED' };
+  }
+
+  private validVisitorToken(token: string): boolean {
+    return /^[A-Za-z0-9_-]{40,90}$/.test(token);
+  }
+
   async listAudit(actor: AuthenticatedPrincipal): Promise<AuditEventEntity[]> {
     this.requirePlatformAdmin(actor);
     return this.dataSource.getRepository(AuditEventEntity).find({ order: { createdAt: 'DESC' }, take: 100 });
@@ -811,7 +849,7 @@ export class PlatformCoreService {
   private async appendControl(
     manager: EntityManager,
     input: {
-      actorId: string;
+      actorId: string | null;
       action: string;
       objectType: string;
       objectId: string;

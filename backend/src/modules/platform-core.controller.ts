@@ -4,7 +4,7 @@ import { Throttle } from '@nestjs/throttler';
 import { IsIn, IsInt, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min, MinLength } from 'class-validator';
 import { Request, Response } from 'express';
 import { ErrorCode } from '../common/errors';
-import { csrfCookieName } from '../common/crypto';
+import { csrfCookieName, randomToken } from '../common/crypto';
 import { AuthenticatedPrincipal, PlatformCoreService } from './platform-core.service';
 import { WorkflowStatus, WORKFLOW_STATUSES } from './workflow/workflow-transitions';
 
@@ -304,6 +304,29 @@ export class PlatformCoreController {
     const actor = await this.actor(req);
     const data = await this.core.consentSnapshot(actor);
     return { success: true, data };
+  }
+
+  @Post('v1/visitor-consents')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({ summary: 'ثبت رضایت کوکی اختیاری برای بازدیدکننده بدون ورود' })
+  async visitorConsent(@Req() req: AuthedRequest, @Res({ passthrough: true }) res: Response, @Body() dto: ConsentDto) {
+    this.assertOrigin(req);
+    const cookieName = this.core.sessionPolicy().secure ? '__Host-bj_visitor' : 'bj_visitor';
+    const received = req.cookies?.[cookieName] as string | undefined;
+    const token = received && /^[A-Za-z0-9_-]{40,90}$/.test(received) ? received : randomToken();
+    const record = await this.core.recordVisitorConsent(token, dto, this.correlation(req));
+    res.cookie(cookieName, token, {
+      httpOnly: true, secure: this.core.sessionPolicy().secure, sameSite: 'lax', path: '/', maxAge: 180 * 24 * 60 * 60 * 1000,
+    });
+    return { success: true, data: { id: record.id, purpose: record.purpose, decision: record.decision } };
+  }
+
+  @Get('v1/visitor-consents/me')
+  @ApiOperation({ summary: 'وضعیت رضایت کوکی اختیاری بازدیدکننده' })
+  async visitorConsentSnapshot(@Req() req: Request) {
+    const cookieName = this.core.sessionPolicy().secure ? '__Host-bj_visitor' : 'bj_visitor';
+    const token = req.cookies?.[cookieName] as string | undefined;
+    return { success: true, data: await this.core.visitorConsentSnapshot(token) };
   }
 
   @Get('v1/audit-events')

@@ -13,6 +13,7 @@ Tables:
 - `audit_events` — actor, action, object, correlation id. A trigger rejects UPDATE, DELETE and TRUNCATE
 - `outbox_events` — event id, name, aggregate id, payload, `publishedAt`, attempts, last error. Dispatch claims rows with `FOR UPDATE SKIP LOCKED`
 - `consent_records` — purpose `ANALYTICS` or `ADVERTISING`, policy version, decision, timestamp
+- `visitor_consents` — anonymous visitor cookie hash, purpose, policy version, grant or withdrawal and UTC timestamp. The raw cookie is never stored; missing cookies default to no optional purposes. Add retention and policy-version handling before production integration.
 - `idempotency_records` — principal, scope (operation), key, request hash, stored response. Unique per principal, scope and key
 
 No booking, inventory, ticket, payment, crew, or maintenance tables.

@@ -256,6 +256,27 @@ export class ConsentRecordEntity {
   recordedAt!: Date;
 }
 
+@Entity({ name: 'visitor_consents' })
+export class VisitorConsentEntity {
+  @PrimaryColumn('uuid')
+  id!: string;
+
+  @Column({ type: 'varchar' })
+  visitorHash!: string;
+
+  @Column({ type: 'varchar' })
+  purpose!: 'ANALYTICS' | 'ADVERTISING';
+
+  @Column({ type: 'varchar' })
+  policyVersion!: string;
+
+  @Column({ type: 'varchar' })
+  decision!: 'GRANTED' | 'WITHDRAWN';
+
+  @CreateDateColumn({ type: 'timestamptz' })
+  recordedAt!: Date;
+}
+
 @Entity({ name: 'idempotency_records' })
 @Index(['principalId', 'scope', 'key'], { unique: true })
 export class IdempotencyRecordEntity {

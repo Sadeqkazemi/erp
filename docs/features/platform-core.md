@@ -35,6 +35,6 @@
 - SSO (OIDC) with phishing-resistant MFA for staff instead of local password + TOTP (diagram 49).
 - Provision a durable HTTP broker ingress, dead-letter handling and outbox lag alerts. Configure `OUTBOX_PUBLISH_URL` and `OUTBOX_PUBLISH_TOKEN` before production startup. The ingress MUST acknowledge only after durable broker acceptance, and deduplicate on `eventId`; otherwise a 2xx response can lose an event. Retries are at-least-once.
 - Workflow engine: persisted steps, compensations and timers beyond the status state machine.
-- Anonymous consent for visitors before login (rules §9); consent currently requires a session.
+- [x] Anonymous visitor consent API before login; origin-checked POST, HttpOnly opaque cookie, stored hash, default denial and withdrawal (`visitor-consent.spec.ts`). Website integration must gate optional scripts, surface policy versions, and define retention before rollout.
 - SAST, SBOM, signed image and artifact attestation in CI (rules §6).
 - Management panel UI (bilingual, four theme/locale combinations); API error messages are Persian only and clients should localise by `error.code`.
