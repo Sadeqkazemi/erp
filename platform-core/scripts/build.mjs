@@ -1,0 +1,11 @@
+import {readFile,mkdir,writeFile,cp} from 'node:fs/promises';
+const root=new URL('../',import.meta.url);
+const html=await readFile(new URL('dist/index.html',root),'utf8');
+await mkdir(new URL('dist/server/',root),{recursive:true});
+await mkdir(new URL('dist/.openai/',root),{recursive:true});
+await cp(new URL('.openai/hosting.json',root),new URL('dist/.openai/hosting.json',root));
+let worker=await readFile(new URL('worker/index.js',root),'utf8');
+const catalog=await readFile(new URL('worker/catalog.js',root),'utf8');
+worker=worker.replace("import {catalog} from './catalog.js';",catalog).replace("import {page} from './page.js';",`const page = ${JSON.stringify(html)};`);
+await writeFile(new URL('dist/server/index.js',root),worker);
+console.log('Worker bundle ready');
