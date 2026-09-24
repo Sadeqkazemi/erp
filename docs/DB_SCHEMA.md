@@ -14,6 +14,8 @@ Tables:
 - `outbox_events` — event id, name, aggregate id, payload, `publishedAt`, attempts, last error. Dispatch claims rows with `FOR UPDATE SKIP LOCKED`
 - `consent_records` — purpose `ANALYTICS` or `ADVERTISING`, policy version, decision, timestamp
 - `visitor_consents` — anonymous visitor cookie hash, purpose, policy version, grant or withdrawal and UTC timestamp. The raw cookie is never stored; missing cookies default to no optional purposes. Add retention and policy-version handling before production integration.
+
+Agency principals carry `tenantId` (UUID); staff and customers remain outside agency tenants. Agency usernames are unique within their tenant. Existing agency identities with no verified tenant mapping cannot authenticate after this migration; map them from an authoritative agency registry, then validate the agency constraint. Audit events carry the actor's tenant ID. This is a foundation for tenant policy; domain services must independently enforce tenant and object permissions. Do not assign tenant IDs by guessing from usernames.
 - `idempotency_records` — principal, scope (operation), key, request hash, stored response. Unique per principal, scope and key
 
 No booking, inventory, ticket, payment, crew, or maintenance tables.

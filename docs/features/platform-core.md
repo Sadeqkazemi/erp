@@ -31,7 +31,7 @@
 
 ## Open items (not done in this change)
 
-- Tenant / agency scoping of principals, panels and audit (rules §7). Needs an agreed tenant model.
+- [x] Agency identity lookup uses explicit tenant UUID; audit records carry tenant ID, and unmapped legacy agency identities cannot log in (`agency-scope.spec.ts`). Still required: authoritative agency registry/backfill, tenant-scoped panel entitlements, gateway/domain object policy and cross-agency end-to-end denial tests.
 - SSO (OIDC) with phishing-resistant MFA for staff instead of local password + TOTP (diagram 49).
 - Provision a durable HTTP broker ingress, dead-letter handling and outbox lag alerts. Configure `OUTBOX_PUBLISH_URL` and `OUTBOX_PUBLISH_TOKEN` before production startup. The ingress MUST acknowledge only after durable broker acceptance, and deduplicate on `eventId`; otherwise a 2xx response can lose an event. Retries are at-least-once.
 - Workflow engine: persisted steps, compensations and timers beyond the status state machine.

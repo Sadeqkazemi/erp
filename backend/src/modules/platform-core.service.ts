@@ -39,6 +39,7 @@ export interface AuthenticatedPrincipal {
   realm: PrincipalEntity['realm'];
   username: string;
   role: PrincipalEntity['role'];
+  tenantId: string | null;
   sessionId: string;
   csrfToken: string;
 }
@@ -94,7 +95,14 @@ export class PlatformCoreService {
     password: string;
     role: PrincipalEntity['role'];
     totpSecret?: string;
+    tenantId?: string;
   }): Promise<{ id: string; totpSecret: string | null }> {
+    if ((input.realm === 'AGENCY' && !input.tenantId) || (input.realm !== 'AGENCY' && input.tenantId)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'شناسه آژانس برای هویت آژانس الزامی است.' });
+    }
+    if (input.tenantId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.tenantId)) {
+      throw new BadRequestException({ code: ErrorCode.VALIDATION, message: 'شناسه آژانس نامعتبر است.' });
+    }
     if (input.realm !== 'STAFF' && input.role === 'PLATFORM_ADMIN') {
       throw new ForbiddenException({
         code: ErrorCode.REALM_REJECTED,
@@ -106,6 +114,7 @@ export class PlatformCoreService {
       id: randomUUID(),
       realm: input.realm,
       username: input.username,
+      tenantId: input.tenantId ?? null,
       passwordHash: await argon2.hash(input.password, ARGON2_OPTIONS),
       mfaSecretCiphertext: totpSecret ? encryptSecret(totpSecret, this.env.mfaEncryptionKey) : null,
       role: input.role,
@@ -124,6 +133,7 @@ export class PlatformCoreService {
     username: string;
     password: string;
     totp?: string;
+    tenantId?: string;
   }): Promise<{ principal: AuthenticatedPrincipal; sessionToken: string; csrfToken: string }> {
     if (input.realm === 'WORKLOAD') {
       throw new ForbiddenException({
@@ -131,12 +141,18 @@ export class PlatformCoreService {
         message: 'هویت سرویس با رمز عبور وارد نمی‌شود؛ از هویت کاری کوتاه‌عمر استفاده کنید.',
       });
     }
-    const principal = await this.dataSource.getRepository(PrincipalEntity).findOne({
-      where: { realm: input.realm, username: input.username, status: 'ACTIVE' },
-    });
     const invalid = new UnauthorizedException({
       code: ErrorCode.INVALID_CREDENTIALS,
       message: 'نام کاربری یا رمز عبور نادرست است.',
+    });
+    if ((input.realm === 'AGENCY' && !input.tenantId) || (input.realm !== 'AGENCY' && input.tenantId)) {
+      throw invalid;
+    }
+    const principal = await this.dataSource.getRepository(PrincipalEntity).findOne({
+      where: {
+        realm: input.realm, username: input.username, status: 'ACTIVE',
+        ...(input.realm === 'AGENCY' ? { tenantId: input.tenantId } : {}),
+      },
     });
     // Verify against a dummy hash for unknown users so response time does not reveal which usernames exist.
     const passwordOk = await argon2.verify(principal?.passwordHash ?? (await this.dummyHash()), input.password);
@@ -199,6 +215,7 @@ export class PlatformCoreService {
       realm: principal.realm,
       username: principal.username,
       role: principal.role,
+      tenantId: principal.tenantId,
       sessionId: session.id,
       csrfToken: '',
     };
@@ -837,6 +854,7 @@ export class PlatformCoreService {
         realm: principal.realm,
         username: principal.username,
         role: principal.role,
+        tenantId: principal.tenantId,
         sessionId: session.id,
         csrfToken,
       },
@@ -858,9 +876,11 @@ export class PlatformCoreService {
       payload: Record<string, string>;
     },
   ): Promise<void> {
+    const actor = input.actorId ? await manager.findOneByOrFail(PrincipalEntity, { id: input.actorId }) : null;
     await manager.save(AuditEventEntity, {
       id: randomUUID(),
       actorPrincipalId: input.actorId,
+      tenantId: actor?.tenantId ?? null,
       action: input.action,
       objectType: input.objectType,
       objectId: input.objectId,

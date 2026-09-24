@@ -13,6 +13,11 @@ class LoginDto {
   @IsIn(['STAFF', 'CUSTOMER', 'AGENCY', 'WORKLOAD'])
   realm!: 'STAFF' | 'CUSTOMER' | 'AGENCY' | 'WORKLOAD';
 
+  @ApiProperty({ required: false, description: 'Agency tenant UUID; required for AGENCY realm' })
+  @IsOptional()
+  @IsUUID()
+  tenantId?: string;
+
   @ApiProperty({ example: 'admin' })
   @IsString()
   @MinLength(1)

@@ -1,7 +1,6 @@
 import { Column, CreateDateColumn, Entity, Index, PrimaryColumn, UpdateDateColumn, VersionColumn } from 'typeorm';
 
 @Entity({ name: 'principals' })
-@Index(['realm', 'username'], { unique: true })
 export class PrincipalEntity {
   @PrimaryColumn('uuid')
   id!: string;
@@ -11,6 +10,9 @@ export class PrincipalEntity {
 
   @Column({ type: 'varchar' })
   username!: string;
+
+  @Column({ type: 'uuid', nullable: true })
+  tenantId!: string | null;
 
   @Column({ type: 'varchar' })
   passwordHash!: string;
@@ -188,6 +190,9 @@ export class AuditEventEntity {
 
   @Column({ type: 'uuid', nullable: true })
   actorPrincipalId!: string | null;
+
+  @Column({ type: 'uuid', nullable: true })
+  tenantId!: string | null;
 
   @Column({ type: 'varchar' })
   action!: string;

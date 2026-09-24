@@ -15,6 +15,7 @@ import {
 import { PlatformCoreFoundation1710000000000 } from './migrations/1710000000000-PlatformCoreFoundation';
 import { PlatformCoreHardening1710000000001 } from './migrations/1710000000001-PlatformCoreHardening';
 import { VisitorConsent1710000000002 } from './migrations/1710000000002-VisitorConsent';
+import { AgencyTenant1710000000003 } from './migrations/1710000000003-AgencyTenant';
 
 export const coreEntities = [
   PrincipalEntity,
@@ -38,7 +39,7 @@ export function createDataSource(databaseUrl = process.env.DATABASE_URL): DataSo
     type: 'postgres',
     url: databaseUrl,
     entities: coreEntities,
-    migrations: [PlatformCoreFoundation1710000000000, PlatformCoreHardening1710000000001, VisitorConsent1710000000002],
+    migrations: [PlatformCoreFoundation1710000000000, PlatformCoreHardening1710000000001, VisitorConsent1710000000002, AgencyTenant1710000000003],
     synchronize: false,
   });
 }

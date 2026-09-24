@@ -24,6 +24,8 @@ The core is a control plane. These routes do not create bookings, tickets, inven
 | GET | `/v1/consents/me` | session | Optional cookies default to denied |
 | POST | `/v1/visitor-consents` | Origin, rate limit; anonymous | Record optional cookie grant or withdrawal, set opaque HttpOnly visitor cookie |
 | GET | `/v1/visitor-consents/me` | anonymous visitor cookie | Latest optional cookie decisions; both denied when absent |
+
+Agency login at `POST /v1/sessions` requires `tenantId` (UUID). The username is looked up within that tenant; staff and customer sessions must omit `tenantId`.
 | GET | `/v1/audit-events` | platform admin | Append-only control-plane audit (enforced by a database trigger) |
 
 Idempotency keys: header `Idempotency-Key`, 8–128 characters of `[A-Za-z0-9_-]`, scoped to the caller and the operation. The same key with a different body returns `409 IDEMPOTENCY_PAYLOAD_MISMATCH`.
