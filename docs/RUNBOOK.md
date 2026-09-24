@@ -2,7 +2,7 @@
 
 - Provision roles once per environment: `psql -v db=<db> -v migration_password=... -v runtime_password=... -f backend/scripts/provision-roles.sql`. Keep both passwords in the environment's secret store; never share them across environments.
 - Migrations: `DATABASE_MIGRATION_URL=<migration role> npm run migration:run`. The service never runs migrations and refuses to start while any are pending.
-- Health: `GET /health` returns `status: ok` only when the core database answers `SELECT 1`.
+- Health: use `GET /health/live` for process liveness and `GET /health/ready` for traffic admission. Readiness requires the core database and no pending migration. `GET /health` remains a compatibility alias for readiness. Do not use a domain-service outage as a reason to restart the control plane.
 - Control plane diagnostics: platform admins may read `GET /v1/control-plane/summary`. The `outbox.oldestAgeSeconds` and `outbox.retried` fields help detect delivery lag; `domainSales=UNCONFIGURED` means no sales data source is connected. Do not infer sales or service availability from core counts.
 - Operational ownership: publish a new version with `POST /v1/control-plane/services/:ownerService/operational-profiles` only after the owning team approves its on-call alias, HTTPS runbook, availability/p95 latency target and measured RTO/RPO. Use the latest catalog version as `expectedCurrentVersion`; a `409` means another administrator published first. Never put paging credentials or secret tokens in the profile. `CONFIGURED` proves the contract was recorded, not that the target is currently met.
 - Logs are structured JSON. Session cookies and authorization headers are redacted. Unsafe `X-Request-Id` values are replaced.

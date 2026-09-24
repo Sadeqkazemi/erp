@@ -402,7 +402,13 @@ describe('platform core', () => {
       .expect(409);
     expect(probe.body.error.code).toBe('UPSTREAM_TIMEOUT');
     const health = await request(app.getHttpServer()).get('/health').expect(200);
-    expect(health.body.data.status).toBe('ok');
+    expect(health.body.data.status).toBe('ready');
+    await request(app.getHttpServer()).get('/health/ready').expect(200, {
+      success: true, data: { status: 'ready', service: 'platform-core' },
+    });
+    await request(app.getHttpServer()).get('/health/live').expect(200, {
+      success: true, data: { status: 'live', service: 'platform-core' },
+    });
   });
 
   it('rotates the session and records consent withdrawal', async () => {

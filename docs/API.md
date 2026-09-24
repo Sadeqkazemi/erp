@@ -6,7 +6,9 @@ The core is a control plane. These routes do not create bookings, tickets, inven
 
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
-| GET | `/health` | public | Database ping |
+| GET | `/health` | public | Backward-compatible readiness check |
+| GET | `/health/live` | public | Process liveness without an external dependency |
+| GET | `/health/ready` | public | Database connectivity and no pending migrations; returns 503 when traffic must not be admitted |
 | GET | `/.well-known/jwks.json` | public | Ed25519 public key that verifies panel tokens |
 | POST | `/v1/sessions` | public, throttled (10/min), Origin checked when sent | Staff login requires password and a single-use TOTP. `WORKLOAD` cannot log in with a password. Sets host-only session cookie |
 | GET | `/v1/sessions/me` | active session | Current principal ID, username, realm, role and tenant ID for the management UI; no secrets |

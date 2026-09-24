@@ -37,6 +37,7 @@
 - [x] Versioned workflow definition registry stores owner, allowed steps and their deadlines. Production refuses unregistered runs, wrong owners and unapproved steps/timeouts; existing nonproduction tests can still create legacy ad hoc runs. Registration is immutable and audited (`workflow-definitions.spec.ts`). Domain callbacks and compensation remain separate work.
 - [x] Migrations run only with the migration role; CI tests as the least-privilege runtime role — `.github/workflows/ci.yml`
 - [x] NestJS 11 (Express 5); `npm audit` reports no advisories and CI fails on any high or critical finding — `.github/workflows/ci.yml`
+- [x] Process liveness is separated from database/migration readiness, and pinned CodeQL v4 `security-extended` analysis runs for pull requests, main and a weekly schedule (`health.controller.ts`, `.github/workflows/codeql.yml`).
 - [x] Isolated CI build produces a downloadable build archive, SHA-256 digest and CycloneDX SBOM from the lockfile; signing, provenance attestation and UAT promotion still require release infrastructure — `.github/workflows/build-evidence.yml`.
 
 ## Open items (not done in this change)
@@ -47,5 +48,5 @@
 - Connect the published per-service operational targets to continuous metrics, external alert routing and measured recovery drills. A stored profile is configuration evidence, not proof that its SLO/RTO/RPO has been achieved.
 - [x] Workflow step status and deadlines persist; due-step scanner marks failures, moves runs into failure/compensation, and blocks premature completion (`workflow-steps.e2e-spec.ts`). Versioned definitions now gate production runs and steps. Remaining: authenticated domain callbacks, actual compensation commands/evidence, retries, and end-to-end domain reconciliation.
 - [x] Anonymous visitor consent API before login; origin-checked POST, HttpOnly opaque cookie, stored hash, default denial and withdrawal (`visitor-consent.spec.ts`). Website integration must gate optional scripts, surface policy versions, and define retention before rollout.
-- SAST, signed image and artifact provenance attestation in CI, plus controlled UAT/Production promotion (rules §6).
+- Signed image and artifact provenance attestation in CI, plus controlled UAT/Production promotion (rules §6). CodeQL SAST is now configured; repository security settings must accept its uploaded results.
 - Management panel UI (bilingual, four theme/locale combinations); API error messages are Persian only and clients should localise by `error.code`.

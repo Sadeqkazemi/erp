@@ -10,16 +10,31 @@ export class HealthController {
   constructor(private readonly dataSource: DataSource) {}
 
   @Get()
-  @ApiOperation({ summary: 'سلامت هسته سکو و پایگاه داده' })
+  @ApiOperation({ summary: 'آمادگی هسته سکو؛ سازگار با مسیر قدیمی health' })
   async check() {
+    return this.ready();
+  }
+
+  @Get('live')
+  @ApiOperation({ summary: 'زنده بودن فرایند بدون وابستگی به سرویس بیرونی' })
+  live() {
+    return { success: true, data: { status: 'live', service: 'platform-core' } };
+  }
+
+  @Get('ready')
+  @ApiOperation({ summary: 'آمادگی پایگاه داده و نبود مهاجرت اجرا نشده' })
+  async ready() {
     try {
       await this.dataSource.query('SELECT 1');
+      if (await this.dataSource.showMigrations()) {
+        throw new Error('pending migrations');
+      }
     } catch {
       throw new ServiceUnavailableException({
         code: 'INTERNAL',
-        message: 'پایگاه داده هسته در دسترس نیست.',
+        message: 'هسته برای دریافت ترافیک آماده نیست.',
       });
     }
-    return { success: true, data: { status: 'ok', service: 'platform-core' } };
+    return { success: true, data: { status: 'ready', service: 'platform-core' } };
   }
 }
