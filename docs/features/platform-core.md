@@ -26,6 +26,7 @@
 - [x] Audit log is append-only in the database — e2e `keeps the audit log append-only`
 - [x] Parallel outbox dispatchers never double-deliver — e2e `never dispatches the same outbox row twice`
 - [x] Migrations run only with the migration role; CI tests as the least-privilege runtime role — `.github/workflows/ci.yml`
+- [x] NestJS 11 (Express 5); `npm audit` reports no advisories and CI fails on any high or critical finding — `.github/workflows/ci.yml`
 
 ## Open items (not done in this change)
 
@@ -34,6 +35,5 @@
 - Real broker for the outbox, dead-letter queue and lag alerts; the dispatcher currently publishes in-process.
 - Workflow engine: persisted steps, compensations and timers beyond the status state machine.
 - Anonymous consent for visitors before login (rules §9); consent currently requires a session.
-- NestJS 10 → 11 upgrade to clear the remaining high-severity `npm audit` advisories (`@nestjs/platform-express` → `multer`, `js-yaml`, `lodash`). CI currently fails only on critical.
 - SAST, SBOM, signed image and artifact attestation in CI (rules §6).
 - Management panel UI (bilingual, four theme/locale combinations); API error messages are Persian only and clients should localise by `error.code`.

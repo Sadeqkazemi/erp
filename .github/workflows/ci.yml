@@ -44,8 +44,8 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
-      - name: Dependency audit (fails on critical; open high findings are tracked in docs/features/platform-core.md)
-        run: npm audit --omit=dev --audit-level=critical
+      - name: Dependency audit (fails on high or critical)
+        run: npm audit --audit-level=high
       - name: Provision separate migration and runtime roles
         env:
           PGPASSWORD: ci-only
